@@ -1,0 +1,519 @@
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import subprocess
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Literal, override
+
+import pynvml
+import tyro
+from textual.app import App, ComposeResult, SystemCommand
+from textual.containers import Grid, ScrollableContainer
+from textual.screen import Screen
+from textual.widgets import Footer, Header, Label, Static, TabbedContent, TabPane
+
+
+def main(
+    shell_scripts: tuple[Path, ...],
+    /,
+    gpu_ids: Literal["all_free"] | tuple[int, ...] = "all_free",
+    mem_ratio_threshold: float = 0.1,
+    enforce_python: bool = True,
+) -> None:
+    """The main entry point for the application.
+
+    This function initializes the NVIDIA Management Library (NVML), determines available GPUs,
+    parses the provided shell scripts into commands, and runs the SmallRunner app.
+
+    Args:
+        shell_scripts: Paths to shell scripts containing commands to run.
+        mem_ratio_threshold: The memory usage threshold for considering a GPU as available. Defaults to 0.1.
+        enforce_python: If True, ensures all commands start with 'python'. Defaults to True.
+    """
+    pynvml.nvmlInit()
+    if gpu_ids == "all_free":
+        gpu_ids = get_available_gpus(mem_ratio_threshold)
+    else:
+        gpu_ids = tuple(
+            gpu_id
+            for gpu_id in gpu_ids
+            if get_gpu_memory_usage(gpu_id) <= mem_ratio_threshold
+        )
+    commands = parse_commands(shell_scripts, enforce_python)
+
+    app = SmallRunner(tuple(gpu_ids), tuple(commands))
+    app.run()
+
+
+@dataclass(frozen=True)
+class Command:
+    """Represents a command to be executed."""
+
+    id: int  # Unique identifier for the command
+    args: list[str]  # List of command arguments
+
+    def __repr__(self) -> str:
+        return f"(id={self.id}, {shlex.join(self.args)})"
+
+
+@dataclass
+class FinishedJobInfo:
+    """Represents information about a finished job."""
+
+    command: Command
+    gpu_id: int
+    elapsed_time: float
+    logdir: Path | None
+
+
+@dataclass(frozen=True)
+class GlobalState:
+    """Stores the global state of the application."""
+
+    command_from_gpu_id: dict[int, str]  # Mapping of GPU IDs to their current commands
+    start_time_from_gpu_id: dict[int, float]
+    logdir_from_gpu_id: dict[
+        int, Path | None
+    ]  # Mapping of GPU IDs to their log directories
+    stdout_window_from_gpu_id: dict[
+        int, deque
+    ]  # Mapping of GPU IDs to their stdout output buffers
+    stderr_window_from_gpu_id: dict[
+        int, deque
+    ]  # Mapping of GPU IDs to their stderr output buffers
+    finished_jobs: list[
+        FinishedJobInfo
+    ]  # List of dictionaries containing finished job information
+    start_time: float = time.time()  # Start time for all jobs
+
+
+class GpuOutputContainer(ScrollableContainer):
+    """A widget that displays information about one GPU in the label.
+
+    Args:
+        gpu_id: The ID of the GPU to monitor.
+        state: The global state object.
+    """
+
+    def __init__(self, gpu_id: int, state: GlobalState) -> None:
+        super().__init__(classes="bordered-white")
+        self._gpu_id = gpu_id
+        self._state = state
+
+    # @override
+    def on_mount(self) -> None:
+        self._update_label()
+        self.set_interval(1.0, self._update_label)
+
+    def _update_label(self) -> None:
+        """Update the GPU label with current utilization, memory information, and elapsed time."""
+        handle = pynvml.nvmlDeviceGetHandleByIndex(self._gpu_id)
+        gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        mem_used = float(mem_info.used) / (1024**3)
+        mem_total = float(mem_info.total) / (1024**3)
+
+        start_time = self._state.start_time_from_gpu_id[self._gpu_id]
+        elapsed_time = time.time() - start_time if start_time > 0 else 0
+
+        cmd = self._state.command_from_gpu_id.get(self._gpu_id, "")
+
+        label_parts = [
+            f"GPU{self._gpu_id}",
+            f"{gpu_util}%",
+            f"{mem_used:.1f}/{mem_total:.1f}G",
+        ]
+
+        if cmd:
+            elapsed_str = format_elapsed_time(elapsed_time)
+            label_parts.append(elapsed_str)
+            label_parts.append(cmd if not cmd.startswith("python ") else cmd[7:])
+
+        self.border_title = (
+            "[bold reverse] " + " • ".join(label_parts) + " [/bold reverse]"
+        )
+
+
+class SummaryDisplay(Static):
+    def __init__(self, state: GlobalState, runner: SmallRunner) -> None:
+        super().__init__()
+        self._state = state
+        self._runner = runner
+        self._finish_time = None
+
+    def on_mount(self) -> None:
+        self.update_summary()
+        self.set_interval(1.0, self.update_summary)
+
+    def update_summary(self) -> None:
+        running_jobs = sum(1 for cmd in self._state.command_from_gpu_id.values() if cmd)
+        finished_jobs = len(self._state.command_from_gpu_id) - running_jobs
+        remaining_jobs = len(self._runner._commands_left)
+
+        # Calculate average elapsed time for finished jobs
+        finished_jobs = self._state.finished_jobs
+        if finished_jobs:
+            elapsed_times = [job.elapsed_time for job in finished_jobs]
+            avg_elapsed_time = sum(elapsed_times) / len(elapsed_times)
+        else:
+            avg_elapsed_time = 0
+        avg_elapsed_str = format_elapsed_time(avg_elapsed_time)
+
+        # Calculate total elapsed time
+        if self._finish_time is None and remaining_jobs == 0 and running_jobs == 0:
+            current_time = time.time()
+            self._finish_time = current_time
+
+        if self._finish_time is not None:
+            # Total elapsed time is frozen at finish time
+            total_elapsed_time = self._finish_time - self._state.start_time
+        else:
+            # Total elapsed time is still counting
+            current_time = time.time()
+            total_elapsed_time = current_time - self._state.start_time
+
+        total_elapsed_str = format_elapsed_time(total_elapsed_time)
+
+        summary = (
+            " [dim]•[/dim] ".join(
+                [
+                    f"[dim]Finished jobs:[/dim] {len(finished_jobs)}",
+                    f"[dim]Running jobs:[/dim] {running_jobs}",
+                    f"[dim]Remaining jobs:[/dim] {remaining_jobs}",
+                    f"[dim]Avg elapsed time:[/dim] {avg_elapsed_str}",
+                    f"[dim]Total elapsed time:[/dim] {total_elapsed_str}",
+                ]
+            )
+            + "\n"
+        )
+        self.update(summary)
+
+
+class LogDisplay(Static):
+    """A widget that displays log output for a specific GPU.
+
+    Args:
+        gpu_id: The ID of the GPU to display logs for.
+        state: The global state object.
+        mode: The type of log to display ('stdout' or 'stderr').
+    """
+
+    def __init__(
+        self, gpu_id: int, state: GlobalState, mode: Literal["stdout", "stderr"]
+    ) -> None:
+        super().__init__()
+        self._gpu_id = gpu_id
+        self._state = state
+        self._mode = mode
+
+    # @override
+    def on_mount(self) -> None:
+        """Initialize the widget and set up periodic updates."""
+        self.update("...")
+        self.set_interval(0.5, self._update_display)
+
+    def _update_display(self) -> None:
+        """Update the log display with the latest output."""
+        window = (
+            self._state.stdout_window_from_gpu_id
+            if self._mode == "stdout"
+            else self._state.stderr_window_from_gpu_id
+        )[self._gpu_id]
+        content = "".join(window)
+        self.update(content)
+
+
+class SmallRunner(App):
+    CSS = """
+    .bordered-white { border: round white; }
+    .output-grid { layout: grid; grid-size: 2; }
+    """
+
+    def __init__(
+        self, cuda_device_ids: tuple[int, ...], commands: tuple[Command, ...]
+    ) -> None:
+        super().__init__()
+        self._cuda_device_ids = cuda_device_ids
+        self._commands = commands
+        self._state = GlobalState(
+            command_from_gpu_id={id: "" for id in cuda_device_ids},
+            start_time_from_gpu_id={id: 0.0 for id in cuda_device_ids},
+            logdir_from_gpu_id={id: None for id in cuda_device_ids},
+            stdout_window_from_gpu_id={id: deque(maxlen=100) for id in cuda_device_ids},
+            stderr_window_from_gpu_id={id: deque(maxlen=100) for id in cuda_device_ids},
+            finished_jobs=[],
+        )
+        self._gpu_free_state = {id: True for id in cuda_device_ids}
+        self._commands_left = list(reversed(commands))
+        self._running_commands = {}
+        self._commands_finished = []
+
+    def on_mount(self) -> None:
+        self.set_interval(1.0, self._poll_update)
+
+    def _run_job(self, gpu_id: int, args: tuple[str, ...]) -> None:
+        logdir = Path(
+            f"/tmp/multi_runner_logs/{time.strftime('%Y%m%d_%H%M%S')}_{gpu_id}"
+        )
+        logdir.mkdir(parents=True, exist_ok=True)
+        self._state.logdir_from_gpu_id[gpu_id] = logdir
+        self._state.command_from_gpu_id[gpu_id] = shlex.join(args)
+        self._state.start_time_from_gpu_id[gpu_id] = time.time()
+        stdout_window = self._state.stdout_window_from_gpu_id[gpu_id]
+        stderr_window = self._state.stderr_window_from_gpu_id[gpu_id]
+
+        stdout_window.clear()
+        stderr_window.clear()
+
+        with open(logdir / "stdout.log", "w") as stdout_f, open(
+            logdir / "stderr.log", "w"
+        ) as stderr_f:
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=dict(
+                    os.environ,
+                    CUDA_DEVICE_ORDER="PCI_BUS_ID",
+                    CUDA_VISIBLE_DEVICES=str(gpu_id),
+                ),
+                universal_newlines=True,
+                bufsize=1,
+            )
+
+            self._handle_process_output(
+                process, stdout_f, stderr_f, stdout_window, stderr_window
+            )
+
+        self._gpu_free_state[gpu_id] = True
+        self._state.command_from_gpu_id[gpu_id] = ""
+        stdout_window.clear()
+        stderr_window.clear()
+
+    def _handle_process_output(
+        self, process, stdout_f, stderr_f, stdout_window, stderr_window
+    ) -> None:
+        import select
+
+        def process_stream(stream, file, window):
+            line = stream.readline()
+            if line:
+                file.write(line)
+                file.flush()
+                window.append(line)
+
+        while True:
+            rlist, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
+
+            for ready_stream in rlist:
+                if ready_stream == process.stdout:
+                    process_stream(process.stdout, stdout_f, stdout_window)
+                elif ready_stream == process.stderr:
+                    process_stream(process.stderr, stderr_f, stderr_window)
+
+            if process.poll() is not None:
+                break
+
+        # Read any remaining output
+        for stream, file, window in [
+            (process.stdout, stdout_f, stdout_window),
+            (process.stderr, stderr_f, stderr_window),
+        ]:
+            for line in stream:
+                process_stream(stream, file, window)
+
+    def _poll_update(self) -> None:
+        for gpu_id, free in self._gpu_free_state.items():
+            if not free:
+                continue
+
+            if gpu_id in self._running_commands:
+                finished_command = self._running_commands.pop(gpu_id)
+                end_time = time.time()
+                elapsed_time = end_time - self._state.start_time_from_gpu_id[gpu_id]
+                elapsed_str = format_elapsed_time(elapsed_time)
+
+                finished_job_info = FinishedJobInfo(
+                    command=finished_command,
+                    gpu_id=gpu_id,
+                    elapsed_time=elapsed_time,
+                    logdir=self._state.logdir_from_gpu_id[gpu_id],
+                )
+                self._state.finished_jobs.append(finished_job_info)
+
+                self._commands_finished.append(
+                    f"{finished_command} in {elapsed_str}, logs to {finished_job_info.logdir}"
+                )
+
+            if self._commands_left:
+                command = self._commands_left.pop()
+                self._running_commands[gpu_id] = command
+                self._gpu_free_state[gpu_id] = False
+                threading.Thread(
+                    target=self._run_job, args=(gpu_id, command.args)
+                ).start()
+
+        self._update_list("#list-waiting", self._commands_left)
+        self._update_list(
+            "#list-running",
+            [
+                f"GPU {gpu_id}: {command}, logs to {self._state.logdir_from_gpu_id[gpu_id]}"
+                for gpu_id, command in sorted(self._running_commands.items())
+            ],
+        )
+        self._update_list("#list-finished", self._commands_finished)
+
+    def _update_list(self, selector: str, items: list) -> None:
+        list_widget = self.query_one(selector)
+        assert isinstance(list_widget, Static)
+        list_widget.update("\n".join(map(str, items)))
+
+    @override
+    def compose(self) -> ComposeResult:
+        with TabbedContent():
+            yield from self._create_log_tab("Outputs", "stdout")
+            yield from self._create_log_tab("Errors", "stderr")
+            yield from self._create_queue_tab()
+        yield Footer()
+
+    def _create_log_tab(
+        self, title: str, log_mode: Literal["stdout", "stderr"]
+    ) -> ComposeResult:
+        with TabPane(title):
+            yield SummaryDisplay(self._state, self)
+            with Grid(classes="output-grid"):
+                for i in self._cuda_device_ids:
+                    # with GPUContainer(classes=border_class):
+                    with GpuOutputContainer(i, self._state):
+                        # with ScrollableContainer():
+                        yield LogDisplay(i, self._state, log_mode)
+
+    def _create_queue_tab(self) -> ComposeResult:
+        with TabPane("Queue"):
+            yield SummaryDisplay(self._state, self)
+            with Grid():
+                for title, id in [
+                    ("Waiting", "waiting"),
+                    ("Running", "running"),
+                    ("Finished", "finished"),
+                ]:
+                    with ScrollableContainer(classes="bordered-white") as container:
+                        container.border_title = (
+                            f"[bold reverse] {title} [/bold reverse]"
+                        )
+                        yield Static(id=f"list-{id}")
+
+
+def get_available_gpus(mem_ratio_threshold: float) -> tuple[int, ...]:
+    """Determine the tuple of available GPU IDs based on memory usage and visibility.
+
+    This function filters GPUs based on their memory usage and the CUDA_VISIBLE_DEVICES
+    environment variable.
+
+    Args:
+        mem_ratio_threshold: The maximum memory usage ratio for a GPU to be considered available.
+
+    Returns:
+        A tuple of available GPU IDs.
+    """
+    gpu_ids = [
+        i
+        for i in range(pynvml.nvmlDeviceGetCount())
+        if get_gpu_memory_usage(i) <= mem_ratio_threshold
+    ]
+    print(f"After filtering by memory threshold: {gpu_ids}")
+
+    return tuple(sorted(gpu_ids))
+
+
+def get_gpu_memory_usage(gpu_index: int) -> float:
+    """Get the memory usage ratio for a specific GPU.
+
+    Args:
+        gpu_index: The index of the GPU to check.
+
+    Returns:
+        The ratio of used memory to total memory for the specified GPU.
+    """
+    handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    return float(info.used) / float(info.total)
+
+
+def parse_commands(
+    shell_scripts: tuple[Path, ...], enforce_python: bool
+) -> list[Command]:
+    """Parse shell scripts into a list of Command objects.
+
+    This function reads the contents of the provided shell scripts, splits them into lines,
+    and creates Command objects for each non-empty, non-comment line.
+
+    Args:
+        shell_scripts: Paths to shell scripts containing commands.
+        enforce_python: If True, ensures all commands start with 'python'.
+
+    Returns:
+        A list of Command objects representing the parsed commands.
+
+    Raises:
+        AssertionError: If enforce_python is True and a command doesn't start with 'python'.
+    """
+    script_contents = "\n".join(script.read_text() for script in shell_scripts)
+    lines = re.split(r"(?<!\\)\n", script_contents)
+
+    commands = []
+    for i, line in enumerate(lines):
+        if line.strip() and not line.strip().startswith("#"):
+            if enforce_python:
+                assert line.startswith(
+                    "python "
+                ), f"Line {i+1} must start with 'python' when enforce_python is True"
+            commands.append(Command(i, shlex.split(line)))
+
+    return commands
+
+
+def format_elapsed_time(elapsed_time: float) -> str:
+    """
+    Format elapsed time into a human-readable string.
+
+    Args:
+        elapsed_time: The elapsed time in seconds.
+
+    Returns:
+        A formatted string representing the elapsed time.
+         - Less than 60 seconds: "Xs"
+         - Less than 3600 seconds: "Xm Ys"
+         - 3600 seconds or more: "Xh Ym Zs"
+         Where X, Y, and Z are integer values.
+
+    Examples:
+        >>> format_elapsed_time(45)
+        '45s'
+        >>> format_elapsed_time(125)
+        '2m 5s'
+        >>> format_elapsed_time(3725)
+        '1h 2m 5s'
+    """
+    if elapsed_time < 60:
+        return f"{elapsed_time:.0f}s"
+    elif elapsed_time < 3600:
+        minutes, seconds = divmod(elapsed_time, 60)
+        return f"{int(minutes)}m {int(seconds)}s"
+    else:
+        hours, remainder = divmod(elapsed_time, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+
+
+entrypoint = lambda: tyro.cli(main)
+
+
+if __name__ == "__main__":
+    entrypoint()

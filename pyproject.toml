@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "smallrunner"
+version = "0.0.0"
+description = "A small runner project"
+requires-python = ">=3.8"
+dependencies = [
+    "nvidia-ml-py",
+    "tyro",
+    "textual",
+]
+authors = [
+    { name = "brentyi", email = "brentyi@berkeley.edu" },
+]
+
+[project.scripts]
+smallrunner = "smallrunner.smallrunner:entrypoint"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/smallrunner"]

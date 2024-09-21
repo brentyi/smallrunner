@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import select
 import shlex
 import subprocess
 import threading
@@ -9,14 +10,13 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Literal, override
+from typing import IO, Literal, override
 
 import pynvml
 import tyro
-from textual.app import App, ComposeResult, SystemCommand
+from textual.app import App, ComposeResult
 from textual.containers import Grid, ScrollableContainer
-from textual.screen import Screen
-from textual.widgets import Footer, Header, Label, Static, TabbedContent, TabPane
+from textual.widgets import Static, TabbedContent, TabPane
 
 
 def main(
@@ -33,6 +33,7 @@ def main(
 
     Args:
         shell_scripts: Paths to shell scripts containing commands to run.
+        gpu_ids: The GPU IDs to use, or "all_free" to use all available GPUs. Defaults to "all_free".
         mem_ratio_threshold: The memory usage threshold for considering a GPU as available. Defaults to 0.1.
         enforce_python: If True, ensures all commands start with 'python'. Defaults to True.
     """
@@ -59,7 +60,7 @@ class Command:
     args: list[str]  # List of command arguments
 
     def __repr__(self) -> str:
-        return f"(id={self.id}, {shlex.join(self.args)})"
+        return f"[bold](id={self.id}, [cyan]{shlex.join(self.args)}[/cyan])[/bold]"
 
 
 @dataclass
@@ -81,12 +82,9 @@ class GlobalState:
     logdir_from_gpu_id: dict[
         int, Path | None
     ]  # Mapping of GPU IDs to their log directories
-    stdout_window_from_gpu_id: dict[
+    log_window_from_gpu_id: dict[
         int, deque
     ]  # Mapping of GPU IDs to their stdout output buffers
-    stderr_window_from_gpu_id: dict[
-        int, deque
-    ]  # Mapping of GPU IDs to their stderr output buffers
     finished_jobs: list[
         FinishedJobInfo
     ]  # List of dictionaries containing finished job information
@@ -183,11 +181,11 @@ class SummaryDisplay(Static):
         summary = (
             " [dim]•[/dim] ".join(
                 [
-                    f"[dim]Finished jobs:[/dim] {len(finished_jobs)}",
-                    f"[dim]Running jobs:[/dim] {running_jobs}",
-                    f"[dim]Remaining jobs:[/dim] {remaining_jobs}",
-                    f"[dim]Avg elapsed time:[/dim] {avg_elapsed_str}",
-                    f"[dim]Total elapsed time:[/dim] {total_elapsed_str}",
+                    f"[dim]Finished:[/dim] {len(finished_jobs)}",
+                    f"[dim]Running:[/dim] {running_jobs}",
+                    f"[dim]Remaining:[/dim] {remaining_jobs}",
+                    f"[dim]Avg time:[/dim] {avg_elapsed_str}",
+                    f"[dim]Total time:[/dim] {total_elapsed_str}",
                 ]
             )
             + "\n"
@@ -201,18 +199,13 @@ class LogDisplay(Static):
     Args:
         gpu_id: The ID of the GPU to display logs for.
         state: The global state object.
-        mode: The type of log to display ('stdout' or 'stderr').
     """
 
-    def __init__(
-        self, gpu_id: int, state: GlobalState, mode: Literal["stdout", "stderr"]
-    ) -> None:
+    def __init__(self, gpu_id: int, state: GlobalState) -> None:
         super().__init__()
         self._gpu_id = gpu_id
         self._state = state
-        self._mode = mode
 
-    # @override
     def on_mount(self) -> None:
         """Initialize the widget and set up periodic updates."""
         self.update("...")
@@ -220,19 +213,27 @@ class LogDisplay(Static):
 
     def _update_display(self) -> None:
         """Update the log display with the latest output."""
-        window = (
-            self._state.stdout_window_from_gpu_id
-            if self._mode == "stdout"
-            else self._state.stderr_window_from_gpu_id
-        )[self._gpu_id]
+        window = self._state.log_window_from_gpu_id[self._gpu_id]
         content = "".join(window)
         self.update(content)
 
 
 class SmallRunner(App):
     CSS = """
-    .bordered-white { border: round white; }
-    .output-grid { layout: grid; grid-size: 2; }
+    .bordered-white {
+        border: round white;
+    }
+
+    .output-grid {
+        layout: grid;
+        grid-size: 2;
+    }
+
+    ScrollableContainer {
+        scrollbar-color: white;
+        scrollbar-size: 1 1;
+        scrollbar-gutter: stable;
+    }
     """
 
     def __init__(
@@ -245,8 +246,7 @@ class SmallRunner(App):
             command_from_gpu_id={id: "" for id in cuda_device_ids},
             start_time_from_gpu_id={id: 0.0 for id in cuda_device_ids},
             logdir_from_gpu_id={id: None for id in cuda_device_ids},
-            stdout_window_from_gpu_id={id: deque(maxlen=100) for id in cuda_device_ids},
-            stderr_window_from_gpu_id={id: deque(maxlen=100) for id in cuda_device_ids},
+            log_window_from_gpu_id={id: deque(maxlen=100) for id in cuda_device_ids},
             finished_jobs=[],
         )
         self._gpu_free_state = {id: True for id in cuda_device_ids}
@@ -265,11 +265,8 @@ class SmallRunner(App):
         self._state.logdir_from_gpu_id[gpu_id] = logdir
         self._state.command_from_gpu_id[gpu_id] = shlex.join(args)
         self._state.start_time_from_gpu_id[gpu_id] = time.time()
-        stdout_window = self._state.stdout_window_from_gpu_id[gpu_id]
-        stderr_window = self._state.stderr_window_from_gpu_id[gpu_id]
-
-        stdout_window.clear()
-        stderr_window.clear()
+        log_window = self._state.log_window_from_gpu_id[gpu_id]
+        log_window.clear()
 
         with open(logdir / "stdout.log", "w") as stdout_f, open(
             logdir / "stderr.log", "w"
@@ -283,50 +280,51 @@ class SmallRunner(App):
                     CUDA_DEVICE_ORDER="PCI_BUS_ID",
                     CUDA_VISIBLE_DEVICES=str(gpu_id),
                 ),
-                universal_newlines=True,
                 bufsize=1,
+                universal_newlines=True,
             )
 
-            self._handle_process_output(
-                process, stdout_f, stderr_f, stdout_window, stderr_window
-            )
+            self._handle_process_output(process, stdout_f, stderr_f, log_window)
 
         self._gpu_free_state[gpu_id] = True
         self._state.command_from_gpu_id[gpu_id] = ""
-        stdout_window.clear()
-        stderr_window.clear()
+        log_window.clear()
 
     def _handle_process_output(
-        self, process, stdout_f, stderr_f, stdout_window, stderr_window
+        self,
+        process: subprocess.Popen,
+        stdout_f: IO,
+        stderr_f: IO,
+        log_window: deque,
     ) -> None:
-        import select
-
-        def process_stream(stream, file, window):
+        def process_stream(stream: IO, file: IO, window: deque) -> None:
             line = stream.readline()
             if line:
                 file.write(line)
                 file.flush()
                 window.append(line)
 
+        assert process.stdout is not None
+        assert process.stderr is not None
         while True:
             rlist, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
 
             for ready_stream in rlist:
                 if ready_stream == process.stdout:
-                    process_stream(process.stdout, stdout_f, stdout_window)
+                    process_stream(process.stdout, stdout_f, log_window)
                 elif ready_stream == process.stderr:
-                    process_stream(process.stderr, stderr_f, stderr_window)
+                    process_stream(process.stderr, stderr_f, log_window)
 
             if process.poll() is not None:
                 break
 
         # Read any remaining output
-        for stream, file, window in [
-            (process.stdout, stdout_f, stdout_window),
-            (process.stderr, stderr_f, stderr_window),
+        for stream, file in [
+            (process.stdout, stdout_f),
+            (process.stderr, stderr_f),
         ]:
-            for line in stream:
-                process_stream(stream, file, window)
+            for _ in stream:
+                process_stream(stream, file, log_window)
 
     def _poll_update(self) -> None:
         for gpu_id, free in self._gpu_free_state.items():
@@ -348,7 +346,7 @@ class SmallRunner(App):
                 self._state.finished_jobs.append(finished_job_info)
 
                 self._commands_finished.append(
-                    f"{finished_command} in {elapsed_str}, logs to {finished_job_info.logdir}"
+                    f"{finished_command} completed in [green]{elapsed_str}[/green], logs saved to [blue]{finished_job_info.logdir}[/blue]"
                 )
 
             if self._commands_left:
@@ -363,36 +361,29 @@ class SmallRunner(App):
         self._update_list(
             "#list-running",
             [
-                f"GPU {gpu_id}: {command}, logs to {self._state.logdir_from_gpu_id[gpu_id]}"
+                f"GPU {gpu_id}: {command}, logs to [blue]{self._state.logdir_from_gpu_id[gpu_id]}[/blue]"
                 for gpu_id, command in sorted(self._running_commands.items())
             ],
         )
         self._update_list("#list-finished", self._commands_finished)
 
     def _update_list(self, selector: str, items: list) -> None:
-        list_widget = self.query_one(selector)
-        assert isinstance(list_widget, Static)
+        list_widget = self.query_one(selector, Static)
         list_widget.update("\n".join(map(str, items)))
 
     @override
     def compose(self) -> ComposeResult:
         with TabbedContent():
-            yield from self._create_log_tab("Outputs", "stdout")
-            yield from self._create_log_tab("Errors", "stderr")
+            yield from self._create_log_tab("Outputs")
             yield from self._create_queue_tab()
-        yield Footer()
 
-    def _create_log_tab(
-        self, title: str, log_mode: Literal["stdout", "stderr"]
-    ) -> ComposeResult:
+    def _create_log_tab(self, title: str) -> ComposeResult:
         with TabPane(title):
             yield SummaryDisplay(self._state, self)
             with Grid(classes="output-grid"):
                 for i in self._cuda_device_ids:
-                    # with GPUContainer(classes=border_class):
                     with GpuOutputContainer(i, self._state):
-                        # with ScrollableContainer():
-                        yield LogDisplay(i, self._state, log_mode)
+                        yield LogDisplay(i, self._state)
 
     def _create_queue_tab(self) -> ComposeResult:
         with TabPane("Queue"):

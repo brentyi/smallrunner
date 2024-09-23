@@ -18,6 +18,8 @@ def main(num: int) -> None:
         tensors.append(torch.randn((4096, 4096)).cuda())
         time.sleep(0.5)
 
+    assert num % 2 == 0
+
 
 if __name__ == "__main__":
     tyro.cli(main)

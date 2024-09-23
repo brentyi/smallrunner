@@ -72,6 +72,7 @@ class FinishedJobInfo:
     gpu_id: int
     elapsed_time: float
     logdir: Path | None
+    return_code: int
 
 
 @dataclass(frozen=True)
@@ -152,13 +153,12 @@ class SummaryDisplay(Static):
 
     def update_summary(self) -> None:
         running_jobs = sum(1 for cmd in self._state.command_from_gpu_id.values() if cmd)
-        finished_jobs = len(self._state.command_from_gpu_id) - running_jobs
+        finished_jobs = len(self._state.finished_jobs)
         remaining_jobs = len(self._runner._commands_left)
 
         # Calculate average elapsed time for finished jobs
-        finished_jobs = self._state.finished_jobs
         if finished_jobs:
-            elapsed_times = [job.elapsed_time for job in finished_jobs]
+            elapsed_times = [job.elapsed_time for job in self._state.finished_jobs]
             avg_elapsed_time = sum(elapsed_times) / len(elapsed_times)
         else:
             avg_elapsed_time = 0
@@ -179,10 +179,17 @@ class SummaryDisplay(Static):
 
         total_elapsed_str = format_elapsed_time(total_elapsed_time)
 
+        # Calculate number of errors
+        errors = sum(1 for job in self._state.finished_jobs if job.return_code != 0)
+
         summary = (
             " [dim]•[/dim] ".join(
                 [
-                    f"[dim]Finished:[/dim] {len(finished_jobs)}",
+                    (
+                        f"[dim]Finished:[/dim] {finished_jobs} [red]({errors} {'errors' if errors > 1 else 'error'})[/red]"
+                        if errors > 0
+                        else f"[dim]Finished:[/dim] {finished_jobs}"
+                    ),
                     f"[dim]Running:[/dim] {running_jobs}",
                     f"[dim]Remaining:[/dim] {remaining_jobs}",
                     f"[dim]Avg time:[/dim] {avg_elapsed_str}",
@@ -279,6 +286,33 @@ class SmallRunner(App):
         self._state.command_from_gpu_id[gpu_id] = ""
         log_display.clear()
 
+        finished_command = self._running_commands.pop(gpu_id)
+        end_time = time.time()
+        elapsed_time = end_time - self._state.start_time_from_gpu_id[gpu_id]
+        elapsed_str = format_elapsed_time(elapsed_time)
+
+        assert isinstance(process.returncode, int)
+        info = FinishedJobInfo(
+            command=finished_command,
+            gpu_id=gpu_id,
+            elapsed_time=elapsed_time,
+            logdir=self._state.logdir_from_gpu_id[gpu_id],
+            return_code=process.returncode,
+        )
+        self._state.finished_jobs.append(info)
+
+        status_part = (
+            f"[red]failed with code {info.return_code}[/red]"
+            if info.return_code != 0
+            else "[green]completed[/green]"
+        )
+        time_part = f"in [bold]{elapsed_str}[/bold]"
+        log_part = f"logs saved to [blue]{info.logdir}[/blue]"
+
+        finished_message = f"{finished_command} {status_part} {time_part}, {log_part}"
+        self._commands_finished.append(finished_message)
+        self._state.show_on_exit.append(finished_message)
+
     def _handle_process_output(
         self,
         process: subprocess.Popen,
@@ -319,24 +353,6 @@ class SmallRunner(App):
         for gpu_id, free in self._gpu_free_state.items():
             if not free:
                 continue
-
-            if gpu_id in self._running_commands:
-                finished_command = self._running_commands.pop(gpu_id)
-                end_time = time.time()
-                elapsed_time = end_time - self._state.start_time_from_gpu_id[gpu_id]
-                elapsed_str = format_elapsed_time(elapsed_time)
-
-                finished_job_info = FinishedJobInfo(
-                    command=finished_command,
-                    gpu_id=gpu_id,
-                    elapsed_time=elapsed_time,
-                    logdir=self._state.logdir_from_gpu_id[gpu_id],
-                )
-                self._state.finished_jobs.append(finished_job_info)
-
-                self._commands_finished.append(
-                    f"{finished_command} completed in [green]{elapsed_str}[/green], logs saved to [blue]{finished_job_info.logdir}[/blue]"
-                )
 
             if self._commands_left:
                 command = self._commands_left.pop()

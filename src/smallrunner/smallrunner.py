@@ -207,11 +207,6 @@ class SmallRunner(App):
         border: round white;
     }
 
-    .output-grid {
-        layout: grid;
-        grid-size: 2;
-    }
-
     ScrollableContainer {
         scrollbar-color: white;
         scrollbar-size: 1 1;
@@ -245,7 +240,8 @@ class SmallRunner(App):
             print("\t", item)
 
     def on_mount(self) -> None:
-        self.set_interval(1.0, self._poll_update)
+        self.set_interval(0.5, self._poll_update)
+        self._poll_update()
 
     def _run_job(self, gpu_id: int, args: tuple[str, ...]) -> None:
         logdir = Path(
@@ -350,6 +346,14 @@ class SmallRunner(App):
                 process_stream(stream, file)
 
     def _poll_update(self) -> None:
+        # Based on the terminal dimensions and number of GPUs, update `grid-size` for the output grid.
+        # Assume minimum width of 60 characters per GPU.
+        terminal_width, terminal_height = self.size
+        num_gpus = len(self._cuda_device_ids)
+        columns = max(1, min(num_gpus, terminal_width // 60))
+        output_grid = self.query_one(".output-grid", Grid)
+        output_grid.styles.grid_size_columns = columns
+
         for gpu_id, free in self._gpu_free_state.items():
             if not free:
                 continue

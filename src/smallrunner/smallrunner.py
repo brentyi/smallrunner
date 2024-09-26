@@ -16,7 +16,8 @@ import pynvml
 import tyro
 from rich import print
 from textual.app import App, ComposeResult
-from textual.containers import Grid, ScrollableContainer
+from textual.command import Hit, Hits, Provider
+from textual.containers import Grid, ScrollableContainer, VerticalScroll
 from textual.widgets import Log, Static, TabbedContent, TabPane
 
 
@@ -55,12 +56,13 @@ def main(
     app.run()
 
 
-@dataclass(frozen=True)
+@dataclass
 class Command:
     """Represents a command to be executed."""
 
     id: int  # Unique identifier for the command
     args: list[str]  # List of command arguments
+    kill_flag: bool = False  # Flag to indicate if the command should be killed
 
     def __repr__(self) -> str:
         return f"[bold](id={self.id}, [cyan]{shlex.join(self.args)}[/cyan])[/bold]"
@@ -144,6 +146,63 @@ class GpuOutputContainer(ScrollableContainer):
         )
 
 
+class JobAdjustmentCommands(Provider):
+    """A command provider to open a Python file in the current working directory."""
+
+    async def search(self, query: str) -> Hits:
+        """Search for Python files."""
+        matcher = self.matcher(query)
+
+        app = self.app
+        assert isinstance(app, SmallRunner)
+
+        for command in app._commands_left:
+            skip_command = "Skip " + str(command)
+            score = matcher.match(skip_command)
+            if score > 0:
+                yield Hit(
+                    score,
+                    matcher.highlight(skip_command),
+                    lambda id=command.id: app._skip_command(id),
+                    help=f"Don't run this command with id={command.id}.",
+                )
+
+        skip_command = "Skip all waiting jobs"
+        score = matcher.match(skip_command)
+        if score > 0:
+            yield Hit(
+                score,
+                matcher.highlight(skip_command),
+                lambda: app._skip_command("all_remaining"),
+                help=f"Don't run any more commands. Commands that are currently running will be unaffected.",
+            )
+
+        # Add commands for killing running jobs
+        for gpu_id in app._cuda_device_ids:
+            for job_index in range(app._jobs_per_gpu):
+                command = app._running_commands[gpu_id][job_index]
+                if command is not None:
+                    kill_command = f"Kill job on GPU {gpu_id}-{job_index}: {command}"
+                    score = matcher.match(kill_command)
+                    if score > 0:
+                        yield Hit(
+                            score,
+                            matcher.highlight(kill_command),
+                            lambda id=command.id: app._kill_command(id),
+                            help=f"Kill the running job with id={command.id} on GPU {gpu_id}-{job_index}.",
+                        )
+
+        kill_all_command = "Kill all running jobs"
+        score = matcher.match(kill_all_command)
+        if score > 0:
+            yield Hit(
+                score,
+                matcher.highlight(kill_all_command),
+                lambda: app._kill_command("all_running"),
+                help="Kill all currently running jobs.",
+            )
+
+
 class SummaryDisplay(Static):
     def __init__(self, state: GlobalState, runner: SmallRunner) -> None:
         super().__init__()
@@ -206,6 +265,7 @@ class SummaryDisplay(Static):
 
 
 class SmallRunner(App):
+    COMMANDS = App.COMMANDS | {JobAdjustmentCommands}
     CSS = """
     .bordered-white {
         border: round white;
@@ -260,13 +320,47 @@ class SmallRunner(App):
         self.set_interval(0.5, self._poll_update)
         self._poll_update()
 
-    def _run_job(self, gpu_id: int, job_index: int, args: tuple[str, ...]) -> None:
+    def _kill_command(self, command_id: int | Literal["all_running"]) -> None:
+        """Kill a command with the given command_id or all running commands."""
+        if command_id == "all_running":
+            for gpu_id in self._cuda_device_ids:
+                for job_index in range(self._jobs_per_gpu):
+                    command = self._running_commands[gpu_id][job_index]
+                    if command is not None:
+                        command.kill_flag = True
+        else:
+            for gpu_id in self._cuda_device_ids:
+                for job_index in range(self._jobs_per_gpu):
+                    command = self._running_commands[gpu_id][job_index]
+                    if command is not None and command.id == command_id:
+                        command.kill_flag = True
+                        return
+
+    def _skip_command(self, command_id: int | Literal["all_remaining"]) -> None:
+        """Skip the command with the given command_id or all remaining commands."""
+        if command_id == "all_remaining":
+            for command in self._commands_left:
+                finished_message = f"{command} [yellow]skipped[/yellow]"
+                self._commands_finished.append(finished_message)
+                self._state.show_on_exit.append(finished_message)
+            self._commands_left.clear()
+        else:
+            (command,) = [cmd for cmd in self._commands_left if cmd.id == command_id]
+            self._commands_left = [
+                cmd for cmd in self._commands_left if cmd.id != command_id
+            ]
+            finished_message = f"{command} [yellow]skipped[/yellow]"
+            self._commands_finished.append(finished_message)
+            self._state.show_on_exit.append(finished_message)
+
+    def _run_job(self, gpu_id: int, job_index: int, command: Command) -> None:
         logdir = Path(
             f"/tmp/smallrunner_logs/{time.strftime('%Y%m%d_%H%M%S')}_{gpu_id}_{job_index}"
         )
         logdir.mkdir(parents=True, exist_ok=True)
 
         # Useful if smallrunner exits...
+        args = command.args
         self._state.show_on_exit.append(
             f"Started [cyan]{shlex.join(args)}[/cyan] on GPU [bold]{gpu_id}[/bold]-{job_index}, logging to [blue]{logdir}[/blue]"
         )
@@ -293,7 +387,19 @@ class SmallRunner(App):
                 universal_newlines=True,
             )
 
-            self._handle_process_output(process, stdout_f, stderr_f, log_display)
+            self._handle_process_output(
+                command, process, stdout_f, stderr_f, log_display
+            )
+
+            if command.kill_flag:
+                elapsed_time = (
+                    time.time() - self._state.start_time_from_gpu_id[gpu_id][job_index]
+                )
+                elapsed_str = format_elapsed_time(elapsed_time)
+                logdir = self._state.logdir_from_gpu_id[gpu_id][job_index]
+                killed_message = f"{command} [red]killed[/red] after [bold]{elapsed_str}[/bold], logs saved to [blue]{logdir}[/blue]"
+                self._commands_finished.append(killed_message)
+                self._state.show_on_exit.append(killed_message)
 
         self._gpu_free_state[gpu_id][job_index] = True
         self._state.command_from_gpu_id[gpu_id][job_index] = ""
@@ -330,6 +436,7 @@ class SmallRunner(App):
 
     def _handle_process_output(
         self,
+        command: Command,
         process: subprocess.Popen,
         stdout_f: IO,
         stderr_f: IO,
@@ -353,6 +460,10 @@ class SmallRunner(App):
                 elif ready_stream == process.stderr:
                     process_stream(process.stderr, stderr_f)
 
+            if command.kill_flag:
+                process.terminate()
+                break
+
             if process.poll() is not None:
                 break
 
@@ -361,8 +472,11 @@ class SmallRunner(App):
             (process.stdout, stdout_f),
             (process.stderr, stderr_f),
         ]:
-            for _ in stream:
+            for line in stream:
                 process_stream(stream, file)
+
+        if command.kill_flag and process.poll() is None:
+            process.kill()  # Force kill if terminate didn't work
 
     def _poll_update(self) -> None:
         # Based on the terminal dimensions and number of GPUs, update `grid-size` for the output grid.
@@ -383,7 +497,7 @@ class SmallRunner(App):
                     self._running_commands[gpu_id][job_index] = command
                     self._gpu_free_state[gpu_id][job_index] = False
                     threading.Thread(
-                        target=self._run_job, args=(gpu_id, job_index, command.args)
+                        target=self._run_job, args=(gpu_id, job_index, command)
                     ).start()
 
         self._update_list("#list-waiting", self._commands_left)

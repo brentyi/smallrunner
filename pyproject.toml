@@ -21,3 +21,6 @@ smallrunner = "smallrunner.smallrunner:entrypoint"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/smallrunner"]
+
+[tool.ruff.lint]
+ignore = ["E731"]

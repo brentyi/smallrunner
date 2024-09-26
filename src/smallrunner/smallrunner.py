@@ -17,7 +17,7 @@ import tyro
 from rich import print
 from textual.app import App, ComposeResult
 from textual.containers import Grid, ScrollableContainer
-from textual.widgets import Log, RichLog, Static, TabbedContent, TabPane
+from textual.widgets import Log, Static, TabbedContent, TabPane
 
 
 def main(
@@ -26,6 +26,7 @@ def main(
     gpu_ids: Literal["all_free"] | tuple[int, ...] = "all_free",
     mem_ratio_threshold: float = 0.1,
     enforce_python: bool = True,
+    jobs_per_gpu: int = 1,
 ) -> None:
     """The main entry point for the application.
 
@@ -37,6 +38,7 @@ def main(
         gpu_ids: The GPU IDs to use, or "all_free" to use all available GPUs. Defaults to "all_free".
         mem_ratio_threshold: The memory usage threshold for considering a GPU as available. Defaults to 0.1.
         enforce_python: If True, ensures all commands start with 'python'. Defaults to True.
+        jobs_per_gpu: Number of jobs to run simultaneously on each GPU. Defaults to 1.
     """
     pynvml.nvmlInit()
     if gpu_ids == "all_free":
@@ -49,7 +51,7 @@ def main(
         )
     commands = parse_commands(shell_scripts, enforce_python)
 
-    app = SmallRunner(tuple(gpu_ids), tuple(commands))
+    app = SmallRunner(tuple(gpu_ids), tuple(commands), jobs_per_gpu)
     app.run()
 
 
@@ -79,10 +81,12 @@ class FinishedJobInfo:
 class GlobalState:
     """Stores the global state of the application."""
 
-    command_from_gpu_id: dict[int, str]  # Mapping of GPU IDs to their current commands
-    start_time_from_gpu_id: dict[int, float]
+    command_from_gpu_id: dict[
+        int, list[str]
+    ]  # Mapping of GPU IDs to their current commands
+    start_time_from_gpu_id: dict[int, list[float]]
     logdir_from_gpu_id: dict[
-        int, Path | None
+        int, list[Path | None]
     ]  # Mapping of GPU IDs to their log directories
     finished_jobs: list[
         FinishedJobInfo
@@ -99,9 +103,10 @@ class GpuOutputContainer(ScrollableContainer):
         state: The global state object.
     """
 
-    def __init__(self, gpu_id: int, state: GlobalState) -> None:
+    def __init__(self, gpu_id: int, job_index: int, state: GlobalState) -> None:
         super().__init__(classes="bordered-white")
         self._gpu_id = gpu_id
+        self._job_index = job_index
         self._state = state
 
     # @override
@@ -117,20 +122,19 @@ class GpuOutputContainer(ScrollableContainer):
         mem_used = float(mem_info.used) / (1024**3)
         mem_total = float(mem_info.total) / (1024**3)
 
-        start_time = self._state.start_time_from_gpu_id[self._gpu_id]
-        elapsed_time = time.time() - start_time if start_time > 0 else 0
-
-        cmd = self._state.command_from_gpu_id.get(self._gpu_id, "")
-
         label_parts = [
-            f"GPU{self._gpu_id}",
+            f"GPU{self._gpu_id}-{self._job_index}",
             f"{gpu_util}%",
             f"{mem_used:.1f}/{mem_total:.1f}G",
         ]
 
+        cmd = self._state.command_from_gpu_id[self._gpu_id][self._job_index]
+        start_time = self._state.start_time_from_gpu_id[self._gpu_id][self._job_index]
+
         if cmd == "":
             label_parts.append("idle")
         else:
+            elapsed_time = time.time() - start_time if start_time > 0 else 0
             elapsed_str = format_elapsed_time(elapsed_time)
             label_parts.append(elapsed_str)
             label_parts.append(cmd if not cmd.startswith("python ") else cmd[7:])
@@ -215,26 +219,35 @@ class SmallRunner(App):
     """
 
     def __init__(
-        self, cuda_device_ids: tuple[int, ...], commands: tuple[Command, ...]
+        self,
+        cuda_device_ids: tuple[int, ...],
+        commands: tuple[Command, ...],
+        jobs_per_gpu: int = 1,
     ) -> None:
         super().__init__()
 
-        if len(commands) < len(cuda_device_ids):
-            cuda_device_ids = cuda_device_ids[: len(commands)]
+        if len(commands) < len(cuda_device_ids) * jobs_per_gpu:
+            cuda_device_ids = cuda_device_ids[
+                : len(commands) // jobs_per_gpu
+                + (1 if len(commands) % jobs_per_gpu else 0)
+            ]
 
         self._cuda_device_ids = cuda_device_ids
         self._commands = commands
+        self._jobs_per_gpu = jobs_per_gpu
         self._state = GlobalState(
-            command_from_gpu_id={id: "" for id in cuda_device_ids},
-            start_time_from_gpu_id={id: 0.0 for id in cuda_device_ids},
-            logdir_from_gpu_id={id: None for id in cuda_device_ids},
+            command_from_gpu_id={id: [""] * jobs_per_gpu for id in cuda_device_ids},
+            start_time_from_gpu_id={id: [0.0] * jobs_per_gpu for id in cuda_device_ids},
+            logdir_from_gpu_id={id: [None] * jobs_per_gpu for id in cuda_device_ids},
             finished_jobs=[],
             start_time=time.time(),
             show_on_exit=[],
         )
-        self._gpu_free_state = {id: True for id in cuda_device_ids}
+        self._gpu_free_state = {id: [True] * jobs_per_gpu for id in cuda_device_ids}
         self._commands_left = list(reversed(commands))
-        self._running_commands = {}
+        self._running_commands: dict[int, list[Command | None]] = {
+            id: [None] * jobs_per_gpu for id in cuda_device_ids
+        }
         self._commands_finished = []
         atexit.register(self._handle_exit)
 
@@ -247,21 +260,21 @@ class SmallRunner(App):
         self.set_interval(0.5, self._poll_update)
         self._poll_update()
 
-    def _run_job(self, gpu_id: int, args: tuple[str, ...]) -> None:
+    def _run_job(self, gpu_id: int, job_index: int, args: tuple[str, ...]) -> None:
         logdir = Path(
-            f"/tmp/smallrunner_logs/{time.strftime('%Y%m%d_%H%M%S')}_{gpu_id}"
+            f"/tmp/smallrunner_logs/{time.strftime('%Y%m%d_%H%M%S')}_{gpu_id}_{job_index}"
         )
         logdir.mkdir(parents=True, exist_ok=True)
 
         # Useful if smallrunner exits...
         self._state.show_on_exit.append(
-            f"Started [cyan]{shlex.join(args)}[/cyan] on GPU [bold]{gpu_id}[/bold], logging to [blue]{logdir}[/blue]"
+            f"Started [cyan]{shlex.join(args)}[/cyan] on GPU [bold]{gpu_id}[/bold]-{job_index}, logging to [blue]{logdir}[/blue]"
         )
 
-        self._state.logdir_from_gpu_id[gpu_id] = logdir
-        self._state.command_from_gpu_id[gpu_id] = shlex.join(args)
-        self._state.start_time_from_gpu_id[gpu_id] = time.time()
-        log_display = self.query_one(f"#log-display-{gpu_id}", Log)
+        self._state.logdir_from_gpu_id[gpu_id][job_index] = logdir
+        self._state.command_from_gpu_id[gpu_id][job_index] = shlex.join(args)
+        self._state.start_time_from_gpu_id[gpu_id][job_index] = time.time()
+        log_display = self.query_one(f"#log-display-{gpu_id}-{job_index}", Log)
         log_display.clear()
 
         with open(logdir / "stdout.log", "w") as stdout_f, open(
@@ -282,21 +295,23 @@ class SmallRunner(App):
 
             self._handle_process_output(process, stdout_f, stderr_f, log_display)
 
-        self._gpu_free_state[gpu_id] = True
-        self._state.command_from_gpu_id[gpu_id] = ""
+        self._gpu_free_state[gpu_id][job_index] = True
+        self._state.command_from_gpu_id[gpu_id][job_index] = ""
         log_display.clear()
 
-        finished_command = self._running_commands.pop(gpu_id)
+        finished_command = self._running_commands[gpu_id][job_index]
+        self._running_commands[gpu_id][job_index] = None
         end_time = time.time()
-        elapsed_time = end_time - self._state.start_time_from_gpu_id[gpu_id]
+        elapsed_time = end_time - self._state.start_time_from_gpu_id[gpu_id][job_index]
         elapsed_str = format_elapsed_time(elapsed_time)
 
+        assert finished_command is not None
         assert isinstance(process.returncode, int)
         info = FinishedJobInfo(
             command=finished_command,
             gpu_id=gpu_id,
             elapsed_time=elapsed_time,
-            logdir=self._state.logdir_from_gpu_id[gpu_id],
+            logdir=self._state.logdir_from_gpu_id[gpu_id][job_index],
             return_code=process.returncode,
         )
         self._state.finished_jobs.append(info)
@@ -358,24 +373,27 @@ class SmallRunner(App):
         output_grid = self.query_one(".output-grid", Grid)
         output_grid.styles.grid_size_columns = columns
 
-        for gpu_id, free in self._gpu_free_state.items():
-            if not free:
-                continue
+        for gpu_id in self._cuda_device_ids:
+            for job_index in range(self._jobs_per_gpu):
+                if not self._gpu_free_state[gpu_id][job_index]:
+                    continue
 
-            if self._commands_left:
-                command = self._commands_left.pop()
-                self._running_commands[gpu_id] = command
-                self._gpu_free_state[gpu_id] = False
-                threading.Thread(
-                    target=self._run_job, args=(gpu_id, command.args)
-                ).start()
+                if self._commands_left:
+                    command = self._commands_left.pop()
+                    self._running_commands[gpu_id][job_index] = command
+                    self._gpu_free_state[gpu_id][job_index] = False
+                    threading.Thread(
+                        target=self._run_job, args=(gpu_id, job_index, command.args)
+                    ).start()
 
         self._update_list("#list-waiting", self._commands_left)
         self._update_list(
             "#list-running",
             [
-                f"GPU {gpu_id}: {command}, logs to [blue]{self._state.logdir_from_gpu_id[gpu_id]}[/blue]"
-                for gpu_id, command in sorted(self._running_commands.items())
+                f"GPU {gpu_id}-{job_index}: {command}, logs to [blue]{self._state.logdir_from_gpu_id[gpu_id][job_index]}[/blue]"
+                for gpu_id in self._cuda_device_ids
+                for job_index, command in enumerate(self._running_commands[gpu_id])
+                if command is not None
             ],
         )
         self._update_list("#list-finished", self._commands_finished)
@@ -395,13 +413,14 @@ class SmallRunner(App):
             yield SummaryDisplay(self._state, self)
             with Grid(classes="output-grid"):
                 for i in self._cuda_device_ids:
-                    with GpuOutputContainer(i, self._state):
-                        yield Log(
-                            id=f"log-display-{i}",
-                            max_lines=100,
-                            auto_scroll=True,
-                            classes="log-class",
-                        )
+                    for j in range(self._jobs_per_gpu):
+                        with GpuOutputContainer(i, j, self._state):
+                            yield Log(
+                                id=f"log-display-{i}-{j}",
+                                max_lines=100,
+                                auto_scroll=True,
+                                classes="log-class",
+                            )
 
     def _create_queue_tab(self) -> ComposeResult:
         with TabPane("Queue"):

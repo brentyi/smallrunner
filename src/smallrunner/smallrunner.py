@@ -25,6 +25,7 @@ def main(
     shell_scripts: tuple[Path, ...],
     /,
     gpu_ids: Literal["all_free"] | tuple[int, ...] = "all_free",
+    job_index_cond: str = "i>=0",
     mem_ratio_threshold: float = 0.1,
     enforce_python: bool = True,
     jobs_per_gpu: int = 1,
@@ -37,6 +38,7 @@ def main(
     Args:
         shell_scripts: Paths to shell scripts containing commands to run.
         gpu_ids: The GPU IDs to use, or "all_free" to use all available GPUs. Defaults to "all_free".
+        job_index_cond: The condition for running a job based on its index. Defaults to "i>=0" (all jobs).
         mem_ratio_threshold: The memory usage threshold for considering a GPU as available. Defaults to 0.1.
         enforce_python: If True, ensures all commands start with 'python'. Defaults to True.
         jobs_per_gpu: Number of jobs to run simultaneously on each GPU. Defaults to 1.
@@ -50,7 +52,11 @@ def main(
             for gpu_id in gpu_ids
             if get_gpu_memory_usage(gpu_id) <= mem_ratio_threshold
         )
-    commands = parse_commands(shell_scripts, enforce_python)
+    commands = [
+        cmd
+        for i, cmd in enumerate(parse_commands(shell_scripts, enforce_python))
+        if eval(job_index_cond, {"i": i}, {})
+    ]
 
     app = SmallRunner(tuple(gpu_ids), tuple(commands), jobs_per_gpu)
     app.run()
@@ -215,7 +221,10 @@ class SummaryDisplay(Static):
         self.set_interval(1.0, self.update_summary)
 
     def update_summary(self) -> None:
-        running_jobs = sum(1 for cmd in self._state.command_from_gpu_id.values() if cmd)
+        running_jobs = sum(
+            sum(1 for cmd in cmds if cmd)
+            for cmds in self._state.command_from_gpu_id.values()
+        )
         finished_jobs = len(self._state.finished_jobs)
         remaining_jobs = len(self._runner._commands_left)
 

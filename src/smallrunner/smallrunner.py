@@ -218,6 +218,10 @@ class SmallRunner(App):
         self, cuda_device_ids: tuple[int, ...], commands: tuple[Command, ...]
     ) -> None:
         super().__init__()
+
+        if len(commands) < len(cuda_device_ids):
+            cuda_device_ids = cuda_device_ids[: len(commands)]
+
         self._cuda_device_ids = cuda_device_ids
         self._commands = commands
         self._state = GlobalState(

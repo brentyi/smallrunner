@@ -17,7 +17,7 @@ import tyro
 from rich import print
 from textual.app import App, ComposeResult
 from textual.command import Hit, Hits, Provider
-from textual.containers import Grid, ScrollableContainer, VerticalScroll
+from textual.containers import Grid, ScrollableContainer
 from textual.widgets import Log, Static, TabbedContent, TabPane
 
 
@@ -180,7 +180,7 @@ class JobAdjustmentCommands(Provider):
                 score,
                 matcher.highlight(skip_command),
                 lambda: app._skip_command("all_remaining"),
-                help=f"Don't run any more commands. Commands that are currently running will be unaffected.",
+                help="Don't run any more commands. Commands that are currently running will be unaffected.",
             )
 
         # Add commands for killing running jobs
@@ -622,9 +622,12 @@ def parse_commands(
     for i, line in enumerate(lines):
         if line.strip() and not line.strip().startswith("#"):
             if enforce_python:
-                assert line.startswith(
-                    "python "
-                ), f"Line {i+1} must start with 'python' when enforce_python is True"
+                assert line.startswith("python "), (
+                    f"Line {i + 1} must start with 'python' when enforce_python is True"
+                )
+
+            # Remove escaped newlines.
+            line = line.replace("\\\n", "").strip()
             commands.append(Command(i, shlex.split(line)))
 
     return commands

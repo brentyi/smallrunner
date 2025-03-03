@@ -327,20 +327,20 @@ class SmallRunner(App):
         scrollbar-size: 1 1;
         scrollbar-background: $surface;
     }
-    
+
     Grid {
         grid-size: 3;
         grid-gutter: 1;
     }
-    
+
     #gpu-groups-grid {
         grid-size: 1;
-        height: 7;
+        height: 10;
         margin-top: 1;
     }
-    
+
     .gpu-groups {
-        height: 6;
+        height: 9;
     }
     """
 
@@ -943,7 +943,7 @@ class SmallRunner(App):
                                     )
 
                         groups_info.append(
-                            f"[bold]G{i + 1}:[/bold] {','.join(str(g) for g in group)} "
+                            f"[bold]Group {i + 1}:[/bold] {','.join(str(g) for g in group)} "
                             + f"([green]{group[0]}[/green]→{', '.join(str(g) for g in group[1:])}): "
                             + f"{' | '.join(connections)}"
                         )

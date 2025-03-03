@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Literal, override
+from typing import IO, Dict, List, Literal, Set, override
 
 import pynvml
 import tyro
@@ -30,6 +30,7 @@ def main(
     enforce_python: bool = True,
     concurrent_jobs: int = 1,
     gpus_per_job: int = 1,
+    use_topology: bool = True,
 ) -> None:
     """The main entry point for the application.
 
@@ -44,6 +45,7 @@ def main(
         enforce_python: If True, ensures all commands start with 'python'. Defaults to True.
         concurrent_jobs: Number of jobs to run concurrently on each primary GPU. Defaults to 1.
         gpus_per_job: Number of GPUs to allocate to each job. Defaults to 1.
+        use_topology: If True, use GPU topology information to optimize GPU allocation. Defaults to True.
     """
     pynvml.nvmlInit()
     if gpu_ids == "all_free":
@@ -60,7 +62,21 @@ def main(
         if eval(job_index_cond, {"i": i}, {})
     ]
 
-    app = SmallRunner(tuple(gpu_ids), tuple(commands), concurrent_jobs, gpus_per_job)
+    # Get GPU topology information if using multiple GPUs per job
+    topology = None
+    if gpus_per_job > 1 and use_topology:
+        try:
+            topology = get_gpu_topology()
+            print("Using GPU topology information for optimized GPU allocation")
+        except Exception as e:
+            print(
+                f"[yellow]Warning: Could not get GPU topology information: {e}[/yellow]"
+            )
+            print("[yellow]Falling back to default GPU allocation[/yellow]")
+
+    app = SmallRunner(
+        tuple(gpu_ids), tuple(commands), concurrent_jobs, gpus_per_job, topology
+    )
     app.run()
 
 
@@ -98,6 +114,9 @@ class GlobalState:
     logdir_from_gpu_id: dict[
         int, list[Path | None]
     ]  # Mapping of GPU IDs to their log directories
+    gpus_used_from_gpu_id: dict[
+        int, list[list[int]]
+    ]  # Mapping of primary GPU IDs to lists of all GPUs used for each job
     finished_jobs: list[
         FinishedJobInfo
     ]  # List of dictionaries containing finished job information
@@ -132,8 +151,19 @@ class GpuOutputContainer(ScrollableContainer):
         mem_used = float(mem_info.used) / (1024**3)
         mem_total = float(mem_info.total) / (1024**3)
 
+        # Get information about all GPUs used by this job
+        gpus_used = self._state.gpus_used_from_gpu_id[self._gpu_id][self._job_index]
+
+        # Create GPU identifier
+        if not gpus_used or len(gpus_used) <= 1:
+            # Single GPU job
+            gpu_label = f"GPU{self._gpu_id}-{self._job_index}"
+        else:
+            # Multi-GPU job
+            gpu_label = f"GPU{self._gpu_id}-{self._job_index} (using GPUs: {','.join(str(g) for g in gpus_used)})"
+
         label_parts = [
-            f"GPU{self._gpu_id}-{self._job_index}",
+            gpu_label,
             f"{gpu_util}%",
             f"{mem_used:.1f}/{mem_total:.1f}G",
         ]
@@ -295,19 +325,38 @@ class SmallRunner(App):
         commands: tuple[Command, ...],
         concurrent_jobs: int = 1,
         gpus_per_job: int = 1,
+        topology: Dict[int, List[int]] = None,
     ) -> None:
         super().__init__()
 
         self._gpus_per_job = gpus_per_job
-        
+        self._topology = topology
+        self._gpu_groups = []  # Will store groups of GPUs for multi-GPU jobs
+
         # If using multi-GPU jobs, limit number of primary GPUs based on --gpus_per_job
         if gpus_per_job > 1 and len(cuda_device_ids) > 1:
             # Calculate max number of jobs we can run with available GPUs
             max_jobs = len(cuda_device_ids) // gpus_per_job
-            # Limit primary GPUs to this number (one primary GPU per multi-GPU job)
-            cuda_device_ids = cuda_device_ids[:max_jobs]
-            print(f"Using {len(cuda_device_ids)} primary GPUs for {max_jobs} multi-GPU jobs (each using {gpus_per_job} GPUs)")
-        
+
+            # Organize primary GPUs based on topology if available
+            if topology and gpus_per_job > 1:
+                # Create groups of primary GPUs that have good connections between them
+                self._gpu_groups = self._create_topology_aware_gpu_groups(
+                    cuda_device_ids, gpus_per_job
+                )
+                # Use the first GPU from each group as primary GPUs
+                primary_gpus = [group[0] for group in self._gpu_groups[:max_jobs]]
+                print(
+                    f"Using {len(primary_gpus)} topology-optimized primary GPUs for {len(primary_gpus)} multi-GPU jobs"
+                )
+                cuda_device_ids = tuple(primary_gpus)
+            else:
+                # Without topology, just use the first n GPUs as primaries
+                cuda_device_ids = cuda_device_ids[:max_jobs]
+                print(
+                    f"Using {len(cuda_device_ids)} primary GPUs for {max_jobs} multi-GPU jobs (each using {gpus_per_job} GPUs)"
+                )
+
         # Limit GPU count if there are fewer commands than GPU slots
         if len(commands) < len(cuda_device_ids) * concurrent_jobs:
             needed_gpus = (len(commands) + concurrent_jobs - 1) // concurrent_jobs
@@ -316,11 +365,18 @@ class SmallRunner(App):
 
         self._cuda_device_ids = cuda_device_ids
         self._commands = commands
-        self._jobs_per_gpu = concurrent_jobs  # Maintain compatibility with existing code
+        self._jobs_per_gpu = (
+            concurrent_jobs  # Maintain compatibility with existing code
+        )
         self._state = GlobalState(
             command_from_gpu_id={id: [""] * concurrent_jobs for id in cuda_device_ids},
-            start_time_from_gpu_id={id: [0.0] * concurrent_jobs for id in cuda_device_ids},
+            start_time_from_gpu_id={
+                id: [0.0] * concurrent_jobs for id in cuda_device_ids
+            },
             logdir_from_gpu_id={id: [None] * concurrent_jobs for id in cuda_device_ids},
+            gpus_used_from_gpu_id={
+                id: [[] for _ in range(concurrent_jobs)] for id in cuda_device_ids
+            },
             finished_jobs=[],
             start_time=time.time(),
             show_on_exit=[],
@@ -332,6 +388,62 @@ class SmallRunner(App):
         }
         self._commands_finished = []
         atexit.register(self._handle_exit)
+
+    def _create_topology_aware_gpu_groups(
+        self, available_gpus: tuple[int, ...], gpus_per_group: int
+    ) -> List[List[int]]:
+        """Create groups of GPUs with optimal topology connections.
+
+        Args:
+            available_gpus: Tuple of available GPU IDs
+            gpus_per_group: Number of GPUs per group
+
+        Returns:
+            List of GPU groups, where each group is a list of GPU IDs
+        """
+        if not self._topology or gpus_per_group <= 1:
+            # Without topology information, just divide GPUs into groups
+            return [
+                list(available_gpus[i : i + gpus_per_group])
+                for i in range(0, len(available_gpus), gpus_per_group)
+            ]
+
+        # Create groups based on topology
+        gpu_groups = []
+        remaining_gpus = set(available_gpus)
+
+        # Process each GPU as a potential primary
+        for primary_gpu in available_gpus:
+            # Skip if this GPU is already assigned
+            if primary_gpu not in remaining_gpus:
+                continue
+
+            # Start a new group with this GPU
+            current_group = [primary_gpu]
+            remaining_gpus.remove(primary_gpu)
+
+            # Add the best-connected GPUs to this group
+            for connected_gpu in self._topology[primary_gpu]:
+                if (
+                    connected_gpu in remaining_gpus
+                    and len(current_group) < gpus_per_group
+                ):
+                    current_group.append(connected_gpu)
+                    remaining_gpus.remove(connected_gpu)
+
+            # If we couldn't find enough connected GPUs, add any available ones
+            while len(current_group) < gpus_per_group and remaining_gpus:
+                current_group.append(next(iter(remaining_gpus)))
+                remaining_gpus.remove(current_group[-1])
+
+            # Add the group to our list
+            gpu_groups.append(current_group)
+
+            # Stop if we have enough groups
+            if len(gpu_groups) * gpus_per_group >= len(available_gpus):
+                break
+
+        return gpu_groups
 
     def _handle_exit(self):
         print("\n[bold]smallrunner[/bold] exiting. Showing on-exit information:")
@@ -384,41 +496,95 @@ class SmallRunner(App):
         # Allocate multiple GPUs if needed
         gpu_ids_for_job = [gpu_id]
         if self._gpus_per_job > 1:
-            # Find additional available GPUs (from the full pool of GPUs, not just primary ones)
-            all_gpu_ids = list(range(pynvml.nvmlDeviceGetCount()))
-            available_gpus = []
-            
-            # First try to find completely free GPUs that aren't primary ones
-            for other_gpu_id in all_gpu_ids:
-                # Skip if it's a primary GPU and already in use
-                if other_gpu_id in self._cuda_device_ids and not all(self._gpu_free_state[other_gpu_id]):
-                    continue
-                
-                # Skip if it's the current GPU
-                if other_gpu_id == gpu_id:
-                    continue
-                    
-                # Skip if memory is in use (by external processes)
-                if get_gpu_memory_usage(other_gpu_id) > 0.1:  # Same threshold used for initial selection
-                    continue
-                    
-                available_gpus.append(other_gpu_id)
-                if len(available_gpus) >= self._gpus_per_job - 1:
-                    break
-                    
-            # Add available GPUs to the job
-            gpu_ids_for_job.extend(available_gpus[:self._gpus_per_job - 1])
-            
+            # Check if we have pre-computed GPU groups from topology analysis
+            if self._gpu_groups:
+                # Find the group that contains this primary GPU
+                group_for_this_gpu = None
+                for group in self._gpu_groups:
+                    if group[0] == gpu_id:
+                        group_for_this_gpu = group
+                        break
+
+                if group_for_this_gpu:
+                    # Use the pre-computed group (skip first one as it's already the primary)
+                    additional_gpus = group_for_this_gpu[1:]
+                    if additional_gpus:
+                        # Verify GPUs are still available
+                        available_additional_gpus = []
+                        for other_gpu_id in additional_gpus:
+                            # Skip if memory is in use (by external processes)
+                            if get_gpu_memory_usage(other_gpu_id) > 0.1:
+                                continue
+
+                            # Skip if it's a primary GPU and already in use
+                            if other_gpu_id in self._cuda_device_ids and not all(
+                                self._gpu_free_state[other_gpu_id]
+                            ):
+                                continue
+
+                            available_additional_gpus.append(other_gpu_id)
+
+                        if available_additional_gpus:
+                            gpu_ids_for_job.extend(available_additional_gpus)
+                            print(
+                                f"Using topology-optimized GPU group for job: {gpu_ids_for_job}"
+                            )
+
+            # If we don't have enough GPUs yet from topology groups, find more
+            if len(gpu_ids_for_job) < self._gpus_per_job:
+                # Find additional available GPUs (from the full pool of GPUs, not just primary ones)
+                all_gpu_ids = list(range(pynvml.nvmlDeviceGetCount()))
+                available_gpus = []
+
+                # Use topology information if available to sort by connection quality
+                if self._topology and gpu_id in self._topology:
+                    # Sort all GPUs by connection quality to this GPU
+                    all_gpu_ids = sorted(
+                        all_gpu_ids,
+                        key=lambda x: self._topology[gpu_id].index(x)
+                        if x in self._topology[gpu_id]
+                        else 9999,
+                    )
+
+                # Find free GPUs
+                for other_gpu_id in all_gpu_ids:
+                    # Skip if already in our list
+                    if other_gpu_id in gpu_ids_for_job:
+                        continue
+
+                    # Skip if it's a primary GPU and already in use
+                    if other_gpu_id in self._cuda_device_ids and not all(
+                        self._gpu_free_state[other_gpu_id]
+                    ):
+                        continue
+
+                    # Skip if memory is in use (by external processes)
+                    if (
+                        get_gpu_memory_usage(other_gpu_id) > 0.1
+                    ):  # Same threshold used for initial selection
+                        continue
+
+                    available_gpus.append(other_gpu_id)
+                    if len(available_gpus) >= self._gpus_per_job - len(gpu_ids_for_job):
+                        break
+
+                # Add available GPUs to the job
+                gpu_ids_for_job.extend(
+                    available_gpus[: self._gpus_per_job - len(gpu_ids_for_job)]
+                )
+
             # Print warning if we couldn't allocate enough GPUs
             if len(gpu_ids_for_job) < self._gpus_per_job:
-                print(f"[yellow]Warning: Could only allocate {len(gpu_ids_for_job)} GPUs for job instead of requested {self._gpus_per_job}[/yellow]")
-                
+                print(
+                    f"[yellow]Warning: Could only allocate {len(gpu_ids_for_job)} GPUs for job instead of requested {self._gpus_per_job}[/yellow]"
+                )
+
             # Mark the additional GPUs as in use (only needed for those that are primary GPUs)
             for other_gpu_id in gpu_ids_for_job[1:]:
                 if other_gpu_id in self._gpu_free_state:
                     for other_job_index in range(self._jobs_per_gpu):
                         self._gpu_free_state[other_gpu_id][other_job_index] = False
-        
+
         visible_devices = ",".join(str(g) for g in gpu_ids_for_job)
 
         # Useful if smallrunner exits...
@@ -426,7 +592,7 @@ class SmallRunner(App):
         gpu_info = f"GPU [bold]{gpu_id}[/bold]-{job_index}"
         if len(gpu_ids_for_job) > 1:
             gpu_info += f" (using GPUs: {visible_devices})"
-            
+
         self._state.show_on_exit.append(
             f"Started [cyan]{shlex.join(args)}[/cyan] on {gpu_info}, logging to [blue]{logdir}[/blue]"
         )
@@ -434,6 +600,7 @@ class SmallRunner(App):
         self._state.logdir_from_gpu_id[gpu_id][job_index] = logdir
         self._state.command_from_gpu_id[gpu_id][job_index] = shlex.join(args)
         self._state.start_time_from_gpu_id[gpu_id][job_index] = time.time()
+        self._state.gpus_used_from_gpu_id[gpu_id][job_index] = gpu_ids_for_job.copy()
         log_display = self.query_one(f"#log-display-{gpu_id}-{job_index}", Log)
         log_display.clear()
 
@@ -469,38 +636,32 @@ class SmallRunner(App):
 
         # Free all GPUs used by this job
         self._gpu_free_state[gpu_id][job_index] = True
-        
-        # If using multiple GPUs, get the list of GPUs used for this job
-        additional_gpus = []
-        if self._gpus_per_job > 1:
-            # Parse CUDA_VISIBLE_DEVICES from the process environment
-            cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-            if hasattr(process, 'args') and hasattr(process, 'env'):
-                # Try to get from process.env if available
-                cuda_visible_devices = process.env.get("CUDA_VISIBLE_DEVICES", cuda_visible_devices)
-            
-            try:
-                # Split and convert to integers
-                gpu_list = cuda_visible_devices.split(",")
-                if len(gpu_list) > 1:
-                    additional_gpus = [int(g) for g in gpu_list[1:] if g.strip().isdigit()]
-            except (ValueError, AttributeError):
-                # If parsing fails, fall back to the approach of freeing all used GPUs
-                pass
-                
-        # Free additional GPUs if we have a list
+
+        # Get the list of all GPUs that were used for this job from our tracking variable
+        additional_gpus = (
+            self._state.gpus_used_from_gpu_id[gpu_id][job_index][1:]
+            if self._state.gpus_used_from_gpu_id[gpu_id][job_index]
+            else []
+        )
+
+        # Free additional GPUs if we have any
         if additional_gpus:
             for other_gpu_id in additional_gpus:
                 if other_gpu_id in self._gpu_free_state:
                     for other_job_index in range(self._jobs_per_gpu):
                         self._gpu_free_state[other_gpu_id][other_job_index] = True
-        # Otherwise free all used GPUs
+
+            # Clear the list of GPUs used for this job
+            self._state.gpus_used_from_gpu_id[gpu_id][job_index] = []
+        # If we don't have tracking info but are using multi-GPU, free all potentially used GPUs
         elif self._gpus_per_job > 1:
             for other_gpu_id in self._cuda_device_ids:
-                if other_gpu_id != gpu_id and any(not free for free in self._gpu_free_state[other_gpu_id]):
+                if other_gpu_id != gpu_id and any(
+                    not free for free in self._gpu_free_state[other_gpu_id]
+                ):
                     for other_job_index in range(self._jobs_per_gpu):
                         self._gpu_free_state[other_gpu_id][other_job_index] = True
-        
+
         self._state.command_from_gpu_id[gpu_id][job_index] = ""
         log_display.clear()
 
@@ -651,6 +812,65 @@ class SmallRunner(App):
                         yield Static(id=f"list-{id}")
 
 
+def get_gpu_topology() -> Dict[int, Set[int]]:
+    """Get GPU topology information showing which GPUs are physically connected.
+
+    This function runs nvidia-smi topo -m and parses the output to find which GPUs
+    have the closest connections (NVLink, PCIe, etc).
+
+    Returns:
+        Dict mapping GPU ID to set of connected GPU IDs (ordered by connection quality)
+    """
+    topology = {}
+    gpu_count = pynvml.nvmlDeviceGetCount()
+
+    # Connection types are ranked by NVML with values from 0 (closest) to 5 (farthest)
+    # 0 = NVML_TOPOLOGY_INTERNAL (same device)
+    # 1 = NVML_TOPOLOGY_SINGLE (same board)
+    # 2 = NVML_TOPOLOGY_MULTIPLE (same system, different boards)
+    # 3 = NVML_TOPOLOGY_HOSTBRIDGE (different systems, connected to same host bridge)
+    # 4 = NVML_TOPOLOGY_NODE (different systems, connected to same NUMA node)
+    # 5 = NVML_TOPOLOGY_SYSTEM (different systems)
+
+    # Initialize empty connections for each GPU
+    for i in range(gpu_count):
+        topology[i] = []
+
+    # For each GPU, get connection info to all other GPUs
+    for i in range(gpu_count):
+        handle_i = pynvml.nvmlDeviceGetHandleByIndex(i)
+        connections = []
+
+        # Check connection to each other GPU
+        for j in range(gpu_count):
+            if i == j:
+                continue  # Skip self
+
+            handle_j = pynvml.nvmlDeviceGetHandleByIndex(j)
+            try:
+                # Get PCIe topology information
+                topo_level = pynvml.nvmlDeviceGetTopologyCommonAncestor(
+                    handle_i, handle_j
+                )
+
+                # Convert the level to a rank based on our preference
+                # NVML_TOPOLOGY_INTERNAL = 0 (same GPU), up to NVML_TOPOLOGY_SYSTEM = 5 (least connected)
+                # Lower numbers are better, so we invert for consistent sorting
+                rank = 5 - topo_level
+                connections.append((j, rank))
+            except pynvml.NVMLError:
+                # If we can't get topology info, assume worst connection
+                connections.append((j, 0))
+
+        # Sort by connection quality (highest rank first)
+        connections.sort(key=lambda x: x[1], reverse=True)
+
+        # Store just the GPU IDs in order of connection quality
+        topology[i] = [gpu_id for gpu_id, _ in connections]
+
+    return topology
+
+
 def get_available_gpus(mem_ratio_threshold: float) -> tuple[int, ...]:
     """Determine the tuple of available GPU IDs based on memory usage and visibility.
 
@@ -665,11 +885,9 @@ def get_available_gpus(mem_ratio_threshold: float) -> tuple[int, ...]:
     """
     gpu_count = pynvml.nvmlDeviceGetCount()
     print(f"Total GPUs detected: {gpu_count}")
-    
+
     gpu_ids = [
-        i
-        for i in range(gpu_count)
-        if get_gpu_memory_usage(i) <= mem_ratio_threshold
+        i for i in range(gpu_count) if get_gpu_memory_usage(i) <= mem_ratio_threshold
     ]
     print(f"After filtering by memory threshold: {gpu_ids}")
 

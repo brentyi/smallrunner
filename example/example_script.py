@@ -1,5 +1,6 @@
 """Dummy script that prints to stdout + stderr, and allocates some memory."""
 
+import os
 import sys
 import time
 
@@ -9,13 +10,18 @@ import tyro
 
 def main(num: int) -> None:
     assert torch.cuda.is_available()
-    
+
     # Print GPU information
     num_gpus = torch.cuda.device_count()
-    print(f"Using {num_gpus} GPUs", flush=True)
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+
+    print(f"Using {num_gpus} GPUs (CUDA_VISIBLE_DEVICES={visible_devices})", flush=True)
+    print(f"Current device: {torch.cuda.current_device()}", flush=True)
+
     for i in range(num_gpus):
         device_name = torch.cuda.get_device_name(i)
-        print(f"  GPU {i}: {device_name}", flush=True)
+        memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+        print(f"  GPU {i}: {device_name} ({memory:.1f} GB)", flush=True)
 
     tensors = []
 

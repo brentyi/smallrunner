@@ -329,8 +329,18 @@ class SmallRunner(App):
     }
     
     Grid {
-        grid-size: 2;
+        grid-size: 3;
         grid-gutter: 1;
+    }
+    
+    #gpu-groups-grid {
+        grid-size: 1;
+        height: 7;
+        margin-top: 1;
+    }
+    
+    .gpu-groups {
+        height: 6;
     }
     """
 
@@ -916,7 +926,7 @@ class SmallRunner(App):
                                         topo_level, f"Level_{topo_level}"
                                     )
                                     connections.append(
-                                        f"GPU{primary_gpu}→GPU{other_gpu} ([magenta]{topo_name}[/magenta], rank: {rank})"
+                                        f"GPU{primary_gpu}→{other_gpu} ([magenta]{topo_name}[/magenta])"
                                     )
                             except Exception:
                                 # If we can't get topology info, fall back to simple rank
@@ -926,18 +936,16 @@ class SmallRunner(App):
                                 ):
                                     rank = self._topology[primary_gpu].index(other_gpu)
                                     connections.append(
-                                        f"GPU{primary_gpu}→GPU{other_gpu} (rank: {rank})"
+                                        f"GPU{primary_gpu}→{other_gpu} (rank: {rank})"
                                     )
 
                         groups_info.append(
-                            f"[bold]Group {i + 1}:[/bold] GPUs {','.join(str(g) for g in group)} "
-                            + f"(Primary: [green]{group[0]}[/green], "
-                            + f"Connections: {'; '.join(connections)})"
+                            f"[bold]G{i + 1}:[/bold] {','.join(str(g) for g in group)} "
+                            + f"([green]{group[0]}[/green]→{', '.join(str(g) for g in group[1:])}): "
+                            + f"{' | '.join(connections)}"
                         )
                     else:
-                        groups_info.append(
-                            f"[bold]Group {i + 1}:[/bold] GPU {group[0]}"
-                        )
+                        groups_info.append(f"[bold]G{i + 1}:[/bold] GPU {group[0]}")
 
                 # Update the widget
                 gpu_groups_widget.update("\n".join(groups_info))
@@ -972,6 +980,7 @@ class SmallRunner(App):
     def _create_queue_tab(self) -> ComposeResult:
         with TabPane("Queue"):
             yield SummaryDisplay(self._state, self)
+            # Main job lists
             with Grid():
                 for title, id in [
                     ("Waiting", "waiting"),
@@ -984,9 +993,12 @@ class SmallRunner(App):
                         )
                         yield Static(id=f"list-{id}")
 
-                # Add GPU topology information section if available
-                if self._topology and self._gpus_per_job > 1:
-                    with ScrollableContainer(classes="bordered-white") as container:
+            # GPU groups info in a separate smaller grid
+            if self._topology and self._gpus_per_job > 1:
+                with Grid(id="gpu-groups-grid"):
+                    with ScrollableContainer(
+                        classes="bordered-white gpu-groups"
+                    ) as container:
                         container.border_title = (
                             "[bold reverse] GPU Groups [/bold reverse]"
                         )

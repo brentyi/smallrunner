@@ -915,15 +915,27 @@ class SmallRunner(App):
                     job_thread.start()
 
         self._update_list("#list-waiting", self._commands_left)
-        self._update_list(
-            "#list-running",
-            [
-                f"GPU {gpu_id}-{job_index}: {command}, logs to [blue]{self._state.logdir_from_gpu_id[gpu_id][job_index]}[/blue]"
-                for gpu_id in self._cuda_device_ids
-                for job_index, command in enumerate(self._running_commands[gpu_id])
-                if command is not None
-            ],
-        )
+        # Create running job list with all GPUs used by each job
+        running_jobs = []
+        for gpu_id in self._cuda_device_ids:
+            for job_index, command in enumerate(self._running_commands[gpu_id]):
+                if command is not None:
+                    # Get all GPUs used by this job
+                    gpus_used = self._state.gpus_used_from_gpu_id[gpu_id][job_index]
+                    
+                    # Create GPU identifier based on whether multiple GPUs are used
+                    if not gpus_used or len(gpus_used) <= 1:
+                        # Single GPU job
+                        gpu_label = f"GPU {gpu_id}-{job_index}"
+                    else:
+                        # Multi-GPU job - show all GPUs in the group
+                        gpu_label = f"GPU {','.join(str(g) for g in gpus_used)}-{job_index}"
+                    
+                    running_jobs.append(
+                        f"{gpu_label}: {command}, logs to [blue]{self._state.logdir_from_gpu_id[gpu_id][job_index]}[/blue]"
+                    )
+                    
+        self._update_list("#list-running", running_jobs)
         self._update_list("#list-finished", self._commands_finished)
 
         # Update GPU groups display if using topology

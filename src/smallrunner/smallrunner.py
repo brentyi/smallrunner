@@ -327,6 +327,11 @@ class SmallRunner(App):
         scrollbar-size: 1 1;
         scrollbar-background: $surface;
     }
+    
+    Grid {
+        grid-size: 2;
+        grid-gutter: 1;
+    }
     """
 
     # Flag to indicate if the app is shutting down
@@ -832,6 +837,54 @@ class SmallRunner(App):
         )
         self._update_list("#list-finished", self._commands_finished)
 
+        # Update GPU groups display if using topology
+        if (
+            self._topology
+            and self._gpus_per_job > 1
+            and hasattr(self, "_gpu_groups")
+            and self._gpu_groups
+        ):
+            try:
+                # Get widget if it exists
+                gpu_groups_widget = self.query_one("#list-gpu-groups", Static)
+
+                # Format GPU groups information
+                groups_info = []
+                for i, group in enumerate(self._gpu_groups):
+                    # Show connection info for each group
+                    if len(group) > 1:
+                        connections = []
+                        for j in range(1, len(group)):
+                            # If available, get connection type between primary GPU and others
+                            primary_gpu = group[0]
+                            other_gpu = group[j]
+
+                            if (
+                                primary_gpu in self._topology
+                                and other_gpu in self._topology[primary_gpu]
+                            ):
+                                # Get connection rank (position in the ordered list)
+                                rank = self._topology[primary_gpu].index(other_gpu)
+                                connections.append(
+                                    f"GPU{primary_gpu}→GPU{other_gpu} (rank: {rank})"
+                                )
+
+                        groups_info.append(
+                            f"[bold]Group {i + 1}:[/bold] GPUs {','.join(str(g) for g in group)} "
+                            + f"(Primary: [green]{group[0]}[/green], "
+                            + f"Connections: {'; '.join(connections)})"
+                        )
+                    else:
+                        groups_info.append(
+                            f"[bold]Group {i + 1}:[/bold] GPU {group[0]}"
+                        )
+
+                # Update the widget
+                gpu_groups_widget.update("\n".join(groups_info))
+            except Exception:
+                # If the widget doesn't exist, ignore the error
+                pass
+
     def _update_list(self, selector: str, items: list) -> None:
         list_widget = self.query_one(selector, Static)
         list_widget.update("\n".join(map(str, items)))
@@ -870,6 +923,14 @@ class SmallRunner(App):
                             f"[bold reverse] {title} [/bold reverse]"
                         )
                         yield Static(id=f"list-{id}")
+
+                # Add GPU topology information section if available
+                if self._topology and self._gpus_per_job > 1:
+                    with ScrollableContainer(classes="bordered-white") as container:
+                        container.border_title = (
+                            "[bold reverse] GPU Groups [/bold reverse]"
+                        )
+                        yield Static(id="list-gpu-groups")
 
 
 def get_gpu_topology() -> Dict[int, Set[int]]:

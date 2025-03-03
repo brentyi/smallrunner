@@ -47,6 +47,16 @@ def main(
         gpus_per_job: Number of GPUs to allocate to each job. Defaults to 1.
         use_topology: If True, use GPU topology information to optimize GPU allocation. Defaults to True.
     """
+    # Set up signal handling for cleaner shutdown
+    import signal
+
+    def handle_sigint(sig, frame):
+        print("\nReceived interrupt signal, exiting gracefully...")
+        # Just let the signal propagate to the app's exit handler
+        # The app will set _is_shutting_down to True
+
+    # Register the signal handler
+    signal.signal(signal.SIGINT, handle_sigint)
     pynvml.nvmlInit()
     if gpu_ids == "all_free":
         gpu_ids = get_available_gpus(mem_ratio_threshold)
@@ -319,6 +329,9 @@ class SmallRunner(App):
     }
     """
 
+    # Flag to indicate if the app is shutting down
+    _is_shutting_down = False
+
     def __init__(
         self,
         cuda_device_ids: tuple[int, ...],
@@ -329,9 +342,13 @@ class SmallRunner(App):
     ) -> None:
         super().__init__()
 
+        # Reset the shutting down flag at initialization
+        self.__class__._is_shutting_down = False
+
         self._gpus_per_job = gpus_per_job
         self._topology = topology
         self._gpu_groups = []  # Will store groups of GPUs for multi-GPU jobs
+        self._job_threads = []  # Keep track of running job threads
 
         # If using multi-GPU jobs, limit number of primary GPUs based on --gpus_per_job
         if gpus_per_job > 1 and len(cuda_device_ids) > 1:
@@ -453,6 +470,15 @@ class SmallRunner(App):
     def on_mount(self) -> None:
         self.set_interval(0.5, self._poll_update)
         self._poll_update()
+
+    def exit(self, *args, **kwargs) -> None:
+        """Override exit to mark the app as shutting down."""
+        # Set the shutting down flag to prevent UI updates from threads
+        self._is_shutting_down = True
+        # Allow time for threads to notice the flag
+        time.sleep(0.2)
+        # Call the parent exit method
+        super().exit(*args, **kwargs)
 
     def _kill_command(self, command_id: int | Literal["all_running"]) -> None:
         """Kill a command with the given command_id or all running commands."""
@@ -707,20 +733,37 @@ class SmallRunner(App):
         def process_stream(stream: IO, file: IO) -> None:
             line = stream.readline()
             if line:
-                log_display.write(line)
                 file.write(line)
                 file.flush()
+                # Only update the UI if the app is not shutting down
+                if not self._is_shutting_down:
+                    try:
+                        log_display.write(line)
+                    except Exception:
+                        # Ignore errors when writing to the UI (app might be shutting down)
+                        pass
 
         assert process.stdout is not None
         assert process.stderr is not None
         while True:
-            rlist, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
+            # Exit the loop if the app is shutting down
+            if self._is_shutting_down:
+                break
 
-            for ready_stream in rlist:
-                if ready_stream == process.stdout:
-                    process_stream(process.stdout, stdout_f)
-                elif ready_stream == process.stderr:
-                    process_stream(process.stderr, stderr_f)
+            # Use a try-except block to handle possible errors during select
+            try:
+                rlist, _, _ = select.select(
+                    [process.stdout, process.stderr], [], [], 0.1
+                )
+
+                for ready_stream in rlist:
+                    if ready_stream == process.stdout:
+                        process_stream(process.stdout, stdout_f)
+                    elif ready_stream == process.stderr:
+                        process_stream(process.stderr, stderr_f)
+            except Exception:
+                # An exception here likely means the app is shutting down
+                break
 
             if command.kill_flag:
                 process.terminate()
@@ -729,16 +772,25 @@ class SmallRunner(App):
             if process.poll() is not None:
                 break
 
-        # Read any remaining output
-        for stream, file in [
-            (process.stdout, stdout_f),
-            (process.stderr, stderr_f),
-        ]:
-            for line in stream:
-                process_stream(stream, file)
+        # Read any remaining output if the app is not shutting down
+        if not self._is_shutting_down:
+            try:
+                for stream, file in [
+                    (process.stdout, stdout_f),
+                    (process.stderr, stderr_f),
+                ]:
+                    for line in stream:
+                        process_stream(stream, file)
+            except Exception:
+                # Ignore errors when reading remaining output
+                pass
 
         if command.kill_flag and process.poll() is None:
-            process.kill()  # Force kill if terminate didn't work
+            try:
+                process.kill()  # Force kill if terminate didn't work
+            except Exception:
+                # Ignore errors when killing the process
+                pass
 
     def _poll_update(self) -> None:
         # Based on the terminal dimensions and number of GPUs, update `grid-size` for the output grid.
@@ -758,9 +810,15 @@ class SmallRunner(App):
                     command = self._commands_left.pop()
                     self._running_commands[gpu_id][job_index] = command
                     self._gpu_free_state[gpu_id][job_index] = False
-                    threading.Thread(
-                        target=self._run_job, args=(gpu_id, job_index, command)
-                    ).start()
+
+                    # Create and start a new thread for the job
+                    job_thread = threading.Thread(
+                        target=self._run_job,
+                        args=(gpu_id, job_index, command),
+                        daemon=True,  # Make threads daemon so they exit when main thread exits
+                    )
+                    self._job_threads.append(job_thread)
+                    job_thread.start()
 
         self._update_list("#list-waiting", self._commands_left)
         self._update_list(

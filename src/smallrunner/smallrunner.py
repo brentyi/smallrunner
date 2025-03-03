@@ -616,6 +616,31 @@ class SmallRunner(App):
                     for other_job_index in range(self._jobs_per_gpu):
                         self._gpu_free_state[other_gpu_id][other_job_index] = False
 
+            # Log topology information for debugging
+            if len(gpu_ids_for_job) > 1:
+                try:
+                    primary_gpu = gpu_ids_for_job[0]
+                    for other_gpu in gpu_ids_for_job[1:]:
+                        handle_i = pynvml.nvmlDeviceGetHandleByIndex(primary_gpu)
+                        handle_j = pynvml.nvmlDeviceGetHandleByIndex(other_gpu)
+                        topo_level = pynvml.nvmlDeviceGetTopologyCommonAncestor(
+                            handle_i, handle_j
+                        )
+                        topo_labels = {
+                            0: "INTERNAL",
+                            1: "SINGLE",
+                            2: "MULTIPLE",
+                            3: "HOSTBRIDGE",
+                            4: "NODE",
+                            5: "SYSTEM",
+                        }
+                        topo_name = topo_labels.get(topo_level, f"Level_{topo_level}")
+                        print(
+                            f"[dim]Debug: Connection between GPU{primary_gpu}-GPU{other_gpu}: {topo_name} (level: {topo_level})[/dim]"
+                        )
+                except Exception:
+                    pass  # Ignore errors in topology debugging
+
         visible_devices = ",".join(str(g) for g in gpu_ids_for_job)
 
         # Useful if smallrunner exits...
@@ -859,15 +884,50 @@ class SmallRunner(App):
                             primary_gpu = group[0]
                             other_gpu = group[j]
 
-                            if (
-                                primary_gpu in self._topology
-                                and other_gpu in self._topology[primary_gpu]
-                            ):
-                                # Get connection rank (position in the ordered list)
-                                rank = self._topology[primary_gpu].index(other_gpu)
-                                connections.append(
-                                    f"GPU{primary_gpu}→GPU{other_gpu} (rank: {rank})"
+                            # Get connection type between the GPUs
+                            try:
+                                handle_i = pynvml.nvmlDeviceGetHandleByIndex(
+                                    primary_gpu
                                 )
+                                handle_j = pynvml.nvmlDeviceGetHandleByIndex(other_gpu)
+
+                                # Get connection level (0=same device, 5=separate systems)
+                                topo_level = pynvml.nvmlDeviceGetTopologyCommonAncestor(
+                                    handle_i, handle_j
+                                )
+
+                                # Map topology level to connection type label
+                                topo_labels = {
+                                    0: "INTERNAL",  # Same GPU (shouldn't happen)
+                                    1: "SINGLE",  # Same board
+                                    2: "MULTIPLE",  # Multiple boards, same system
+                                    3: "HOSTBRIDGE",  # Connected via host bridge
+                                    4: "NODE",  # Connected via NUMA node
+                                    5: "SYSTEM",  # Connected via system
+                                }
+
+                                # Add info to connections list
+                                if (
+                                    primary_gpu in self._topology
+                                    and other_gpu in self._topology[primary_gpu]
+                                ):
+                                    rank = self._topology[primary_gpu].index(other_gpu)
+                                    topo_name = topo_labels.get(
+                                        topo_level, f"Level_{topo_level}"
+                                    )
+                                    connections.append(
+                                        f"GPU{primary_gpu}→GPU{other_gpu} ([magenta]{topo_name}[/magenta], rank: {rank})"
+                                    )
+                            except Exception:
+                                # If we can't get topology info, fall back to simple rank
+                                if (
+                                    primary_gpu in self._topology
+                                    and other_gpu in self._topology[primary_gpu]
+                                ):
+                                    rank = self._topology[primary_gpu].index(other_gpu)
+                                    connections.append(
+                                        f"GPU{primary_gpu}→GPU{other_gpu} (rank: {rank})"
+                                    )
 
                         groups_info.append(
                             f"[bold]Group {i + 1}:[/bold] GPUs {','.join(str(g) for g in group)} "

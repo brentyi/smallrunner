@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Dict, List, Literal, Set, override
+from typing import IO, Dict, List, Literal, Optional, Set, override
 
 import pynvml
 import tyro
@@ -73,7 +73,7 @@ def main(
     ]
 
     # Get GPU topology information if using multiple GPUs per job
-    topology = None
+    topology: Optional[Dict[int, List[int]]] = None
     if gpus_per_job > 1 and use_topology:
         try:
             topology = get_gpu_topology()
@@ -353,7 +353,7 @@ class SmallRunner(App):
         commands: tuple[Command, ...],
         concurrent_jobs: int = 1,
         gpus_per_job: int = 1,
-        topology: Dict[int, List[int]] = None,
+        topology: Optional[Dict[int, List[int]]] = None,
     ) -> None:
         super().__init__()
 
@@ -371,7 +371,7 @@ class SmallRunner(App):
             max_jobs = len(cuda_device_ids) // gpus_per_job
 
             # Organize primary GPUs based on topology if available
-            if topology and gpus_per_job > 1:
+            if topology is not None and gpus_per_job > 1:
                 # Create groups of primary GPUs that have good connections between them
                 self._gpu_groups = self._create_topology_aware_gpu_groups(
                     cuda_device_ids, gpus_per_job
@@ -578,12 +578,13 @@ class SmallRunner(App):
                 available_gpus = []
 
                 # Use topology information if available to sort by connection quality
-                if self._topology and gpu_id in self._topology:
-                    # Sort all GPUs by connection quality to this GPU
+                if self._topology is not None and gpu_id in self._topology:
+                    # Sort all GPUs by connection quality to this GPU (with type assertion for mypy)
+                    topology = self._topology  # Make a local non-optional reference
                     all_gpu_ids = sorted(
                         all_gpu_ids,
-                        key=lambda x: self._topology[gpu_id].index(x)
-                        if x in self._topology[gpu_id]
+                        key=lambda x: topology[gpu_id].index(x)
+                        if x in topology[gpu_id]
                         else 9999,
                     )
 
@@ -874,7 +875,7 @@ class SmallRunner(App):
 
         # Update GPU groups display if using topology
         if (
-            self._topology
+            self._topology is not None
             and self._gpus_per_job > 1
             and hasattr(self, "_gpu_groups")
             and self._gpu_groups
@@ -918,7 +919,8 @@ class SmallRunner(App):
 
                                 # Add info to connections list
                                 if (
-                                    primary_gpu in self._topology
+                                    self._topology is not None
+                                    and primary_gpu in self._topology
                                     and other_gpu in self._topology[primary_gpu]
                                 ):
                                     rank = self._topology[primary_gpu].index(other_gpu)
@@ -931,7 +933,8 @@ class SmallRunner(App):
                             except Exception:
                                 # If we can't get topology info, fall back to simple rank
                                 if (
-                                    primary_gpu in self._topology
+                                    self._topology is not None
+                                    and primary_gpu in self._topology
                                     and other_gpu in self._topology[primary_gpu]
                                 ):
                                     rank = self._topology[primary_gpu].index(other_gpu)
@@ -994,7 +997,7 @@ class SmallRunner(App):
                         yield Static(id=f"list-{id}")
 
             # GPU groups info in a separate smaller grid
-            if self._topology and self._gpus_per_job > 1:
+            if self._topology is not None and self._gpus_per_job > 1:
                 with Grid(id="gpu-groups-grid"):
                     with ScrollableContainer(
                         classes="bordered-white gpu-groups"
@@ -1005,14 +1008,14 @@ class SmallRunner(App):
                         yield Static(id="list-gpu-groups")
 
 
-def get_gpu_topology() -> Dict[int, Set[int]]:
+def get_gpu_topology() -> Dict[int, List[int]]:
     """Get GPU topology information showing which GPUs are physically connected.
 
     This function runs nvidia-smi topo -m and parses the output to find which GPUs
     have the closest connections (NVLink, PCIe, etc).
 
     Returns:
-        Dict mapping GPU ID to set of connected GPU IDs (ordered by connection quality)
+        Dict mapping GPU ID to list of connected GPU IDs (ordered by connection quality)
     """
     topology = {}
     gpu_count = pynvml.nvmlDeviceGetCount()

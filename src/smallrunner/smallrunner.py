@@ -159,8 +159,8 @@ class GpuOutputContainer(ScrollableContainer):
             # Single GPU job
             gpu_label = f"GPU{self._gpu_id}-{self._job_index}"
         else:
-            # Multi-GPU job
-            gpu_label = f"GPU{self._gpu_id}-{self._job_index} (using GPUs: {','.join(str(g) for g in gpus_used)})"
+            # Multi-GPU job - compact format showing all GPUs and job index
+            gpu_label = f"GPU{','.join(str(g) for g in gpus_used)}-{self._job_index}"
 
         label_parts = [
             gpu_label,
@@ -589,9 +589,11 @@ class SmallRunner(App):
 
         # Useful if smallrunner exits...
         args = command.args
-        gpu_info = f"GPU [bold]{gpu_id}[/bold]-{job_index}"
-        if len(gpu_ids_for_job) > 1:
-            gpu_info += f" (using GPUs: {visible_devices})"
+        if len(gpu_ids_for_job) <= 1:
+            gpu_info = f"GPU [bold]{gpu_id}[/bold]-{job_index}"
+        else:
+            # More compact format for multi-GPU jobs
+            gpu_info = f"GPU [bold]{','.join(str(g) for g in gpu_ids_for_job)}[/bold]-{job_index}"
 
         self._state.show_on_exit.append(
             f"Started [cyan]{shlex.join(args)}[/cyan] on {gpu_info}, logging to [blue]{logdir}[/blue]"

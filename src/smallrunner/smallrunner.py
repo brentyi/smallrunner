@@ -376,6 +376,10 @@ class SmallRunner(App):
                 self._gpu_groups = self._create_topology_aware_gpu_groups(
                     cuda_device_ids, gpus_per_job
                 )
+                
+                # Sort groups by connection quality (best connections first)
+                self._sort_gpu_groups_by_connection_quality()
+                
                 # Use the first GPU from each group as primary GPUs
                 primary_gpus = [group[0] for group in self._gpu_groups[:max_jobs]]
                 print(
@@ -476,6 +480,55 @@ class SmallRunner(App):
                 break
 
         return gpu_groups
+        
+    def _sort_gpu_groups_by_connection_quality(self) -> None:
+        """Sort GPU groups by connection quality, with best connections first.
+        
+        This evaluates the overall connection quality of each group by calculating
+        the average connection level between the primary GPU and other GPUs in the group.
+        Lower connection levels are better (0=same device, 5=separate systems).
+        """
+        if not self._topology or not self._gpu_groups:
+            return
+            
+        # Calculate connection quality score for each group
+        group_scores = []
+        for group in self._gpu_groups:
+            if len(group) <= 1:
+                # Single GPU groups have perfect score
+                group_scores.append((group, 0))
+                continue
+                
+            primary_gpu = group[0]
+            other_gpus = group[1:]
+            
+            # Calculate average connection level (lower is better)
+            connection_levels = []
+            for other_gpu in other_gpus:
+                try:
+                    handle_i = pynvml.nvmlDeviceGetHandleByIndex(primary_gpu)
+                    handle_j = pynvml.nvmlDeviceGetHandleByIndex(other_gpu)
+                    level = pynvml.nvmlDeviceGetTopologyCommonAncestor(handle_i, handle_j)
+                    connection_levels.append(level)
+                except Exception:
+                    # If we can't get topology info, assume worst connection
+                    connection_levels.append(5)
+            
+            # Calculate average - lower scores are better
+            avg_level = sum(connection_levels) / len(connection_levels) if connection_levels else 5
+            group_scores.append((group, avg_level))
+        
+        # Sort groups by score (lowest/best first)
+        group_scores.sort(key=lambda x: x[1])
+        
+        # Replace groups with sorted version
+        self._gpu_groups = [group for group, _ in group_scores]
+        
+        # Print info about the sorted groups
+        print("GPU groups sorted by connection quality (best first):")
+        for i, (group, score) in enumerate(group_scores):
+            connection_type = "excellent" if score < 2 else "good" if score < 3 else "fair" if score < 4 else "poor"
+            print(f"  Group {i+1}: GPUs {group} - {connection_type} connection quality (score: {score:.1f})")
 
     def _handle_exit(self):
         print("\n[bold]smallrunner[/bold] exiting. Showing on-exit information:")

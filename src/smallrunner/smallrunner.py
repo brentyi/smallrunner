@@ -28,7 +28,8 @@ def main(
     job_index_cond: str = "i>=0",
     mem_ratio_threshold: float = 0.1,
     enforce_python: bool = True,
-    jobs_per_gpu: int = 1,
+    concurrent_jobs: int = 1,
+    gpus_per_job: int = 1,
 ) -> None:
     """The main entry point for the application.
 
@@ -41,7 +42,8 @@ def main(
         job_index_cond: The condition for running a job based on its index. Defaults to "i>=0" (all jobs).
         mem_ratio_threshold: The memory usage threshold for considering a GPU as available. Defaults to 0.1.
         enforce_python: If True, ensures all commands start with 'python'. Defaults to True.
-        jobs_per_gpu: Number of jobs to run simultaneously on each GPU. Defaults to 1.
+        concurrent_jobs: Number of jobs to run concurrently on each primary GPU. Defaults to 1.
+        gpus_per_job: Number of GPUs to allocate to each job. Defaults to 1.
     """
     pynvml.nvmlInit()
     if gpu_ids == "all_free":
@@ -58,7 +60,7 @@ def main(
         if eval(job_index_cond, {"i": i}, {})
     ]
 
-    app = SmallRunner(tuple(gpu_ids), tuple(commands), jobs_per_gpu)
+    app = SmallRunner(tuple(gpu_ids), tuple(commands), concurrent_jobs, gpus_per_job)
     app.run()
 
 
@@ -291,31 +293,42 @@ class SmallRunner(App):
         self,
         cuda_device_ids: tuple[int, ...],
         commands: tuple[Command, ...],
-        jobs_per_gpu: int = 1,
+        concurrent_jobs: int = 1,
+        gpus_per_job: int = 1,
     ) -> None:
         super().__init__()
 
-        if len(commands) < len(cuda_device_ids) * jobs_per_gpu:
-            cuda_device_ids = cuda_device_ids[
-                : len(commands) // jobs_per_gpu
-                + (1 if len(commands) % jobs_per_gpu else 0)
-            ]
+        self._gpus_per_job = gpus_per_job
+        
+        # If using multi-GPU jobs, limit number of primary GPUs based on --gpus_per_job
+        if gpus_per_job > 1 and len(cuda_device_ids) > 1:
+            # Calculate max number of jobs we can run with available GPUs
+            max_jobs = len(cuda_device_ids) // gpus_per_job
+            # Limit primary GPUs to this number (one primary GPU per multi-GPU job)
+            cuda_device_ids = cuda_device_ids[:max_jobs]
+            print(f"Using {len(cuda_device_ids)} primary GPUs for {max_jobs} multi-GPU jobs (each using {gpus_per_job} GPUs)")
+        
+        # Limit GPU count if there are fewer commands than GPU slots
+        if len(commands) < len(cuda_device_ids) * concurrent_jobs:
+            needed_gpus = (len(commands) + concurrent_jobs - 1) // concurrent_jobs
+            cuda_device_ids = cuda_device_ids[:needed_gpus]
+            print(f"Limited to {len(cuda_device_ids)} GPUs based on command count")
 
         self._cuda_device_ids = cuda_device_ids
         self._commands = commands
-        self._jobs_per_gpu = jobs_per_gpu
+        self._jobs_per_gpu = concurrent_jobs  # Maintain compatibility with existing code
         self._state = GlobalState(
-            command_from_gpu_id={id: [""] * jobs_per_gpu for id in cuda_device_ids},
-            start_time_from_gpu_id={id: [0.0] * jobs_per_gpu for id in cuda_device_ids},
-            logdir_from_gpu_id={id: [None] * jobs_per_gpu for id in cuda_device_ids},
+            command_from_gpu_id={id: [""] * concurrent_jobs for id in cuda_device_ids},
+            start_time_from_gpu_id={id: [0.0] * concurrent_jobs for id in cuda_device_ids},
+            logdir_from_gpu_id={id: [None] * concurrent_jobs for id in cuda_device_ids},
             finished_jobs=[],
             start_time=time.time(),
             show_on_exit=[],
         )
-        self._gpu_free_state = {id: [True] * jobs_per_gpu for id in cuda_device_ids}
+        self._gpu_free_state = {id: [True] * concurrent_jobs for id in cuda_device_ids}
         self._commands_left = list(reversed(commands))
         self._running_commands: dict[int, list[Command | None]] = {
-            id: [None] * jobs_per_gpu for id in cuda_device_ids
+            id: [None] * concurrent_jobs for id in cuda_device_ids
         }
         self._commands_finished = []
         atexit.register(self._handle_exit)
@@ -368,10 +381,54 @@ class SmallRunner(App):
         )
         logdir.mkdir(parents=True, exist_ok=True)
 
+        # Allocate multiple GPUs if needed
+        gpu_ids_for_job = [gpu_id]
+        if self._gpus_per_job > 1:
+            # Find additional available GPUs (from the full pool of GPUs, not just primary ones)
+            all_gpu_ids = list(range(pynvml.nvmlDeviceGetCount()))
+            available_gpus = []
+            
+            # First try to find completely free GPUs that aren't primary ones
+            for other_gpu_id in all_gpu_ids:
+                # Skip if it's a primary GPU and already in use
+                if other_gpu_id in self._cuda_device_ids and not all(self._gpu_free_state[other_gpu_id]):
+                    continue
+                
+                # Skip if it's the current GPU
+                if other_gpu_id == gpu_id:
+                    continue
+                    
+                # Skip if memory is in use (by external processes)
+                if get_gpu_memory_usage(other_gpu_id) > 0.1:  # Same threshold used for initial selection
+                    continue
+                    
+                available_gpus.append(other_gpu_id)
+                if len(available_gpus) >= self._gpus_per_job - 1:
+                    break
+                    
+            # Add available GPUs to the job
+            gpu_ids_for_job.extend(available_gpus[:self._gpus_per_job - 1])
+            
+            # Print warning if we couldn't allocate enough GPUs
+            if len(gpu_ids_for_job) < self._gpus_per_job:
+                print(f"[yellow]Warning: Could only allocate {len(gpu_ids_for_job)} GPUs for job instead of requested {self._gpus_per_job}[/yellow]")
+                
+            # Mark the additional GPUs as in use (only needed for those that are primary GPUs)
+            for other_gpu_id in gpu_ids_for_job[1:]:
+                if other_gpu_id in self._gpu_free_state:
+                    for other_job_index in range(self._jobs_per_gpu):
+                        self._gpu_free_state[other_gpu_id][other_job_index] = False
+        
+        visible_devices = ",".join(str(g) for g in gpu_ids_for_job)
+
         # Useful if smallrunner exits...
         args = command.args
+        gpu_info = f"GPU [bold]{gpu_id}[/bold]-{job_index}"
+        if len(gpu_ids_for_job) > 1:
+            gpu_info += f" (using GPUs: {visible_devices})"
+            
         self._state.show_on_exit.append(
-            f"Started [cyan]{shlex.join(args)}[/cyan] on GPU [bold]{gpu_id}[/bold]-{job_index}, logging to [blue]{logdir}[/blue]"
+            f"Started [cyan]{shlex.join(args)}[/cyan] on {gpu_info}, logging to [blue]{logdir}[/blue]"
         )
 
         self._state.logdir_from_gpu_id[gpu_id][job_index] = logdir
@@ -390,7 +447,7 @@ class SmallRunner(App):
                 env=dict(
                     os.environ,
                     CUDA_DEVICE_ORDER="PCI_BUS_ID",
-                    CUDA_VISIBLE_DEVICES=str(gpu_id),
+                    CUDA_VISIBLE_DEVICES=visible_devices,
                 ),
                 bufsize=1,
                 universal_newlines=True,
@@ -410,7 +467,40 @@ class SmallRunner(App):
                 self._commands_finished.append(killed_message)
                 self._state.show_on_exit.append(killed_message)
 
+        # Free all GPUs used by this job
         self._gpu_free_state[gpu_id][job_index] = True
+        
+        # If using multiple GPUs, get the list of GPUs used for this job
+        additional_gpus = []
+        if self._gpus_per_job > 1:
+            # Parse CUDA_VISIBLE_DEVICES from the process environment
+            cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if hasattr(process, 'args') and hasattr(process, 'env'):
+                # Try to get from process.env if available
+                cuda_visible_devices = process.env.get("CUDA_VISIBLE_DEVICES", cuda_visible_devices)
+            
+            try:
+                # Split and convert to integers
+                gpu_list = cuda_visible_devices.split(",")
+                if len(gpu_list) > 1:
+                    additional_gpus = [int(g) for g in gpu_list[1:] if g.strip().isdigit()]
+            except (ValueError, AttributeError):
+                # If parsing fails, fall back to the approach of freeing all used GPUs
+                pass
+                
+        # Free additional GPUs if we have a list
+        if additional_gpus:
+            for other_gpu_id in additional_gpus:
+                if other_gpu_id in self._gpu_free_state:
+                    for other_job_index in range(self._jobs_per_gpu):
+                        self._gpu_free_state[other_gpu_id][other_job_index] = True
+        # Otherwise free all used GPUs
+        elif self._gpus_per_job > 1:
+            for other_gpu_id in self._cuda_device_ids:
+                if other_gpu_id != gpu_id and any(not free for free in self._gpu_free_state[other_gpu_id]):
+                    for other_job_index in range(self._jobs_per_gpu):
+                        self._gpu_free_state[other_gpu_id][other_job_index] = True
+        
         self._state.command_from_gpu_id[gpu_id][job_index] = ""
         log_display.clear()
 
@@ -573,9 +663,12 @@ def get_available_gpus(mem_ratio_threshold: float) -> tuple[int, ...]:
     Returns:
         A tuple of available GPU IDs.
     """
+    gpu_count = pynvml.nvmlDeviceGetCount()
+    print(f"Total GPUs detected: {gpu_count}")
+    
     gpu_ids = [
         i
-        for i in range(pynvml.nvmlDeviceGetCount())
+        for i in range(gpu_count)
         if get_gpu_memory_usage(i) <= mem_ratio_threshold
     ]
     print(f"After filtering by memory threshold: {gpu_ids}")

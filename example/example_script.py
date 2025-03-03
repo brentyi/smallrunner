@@ -9,6 +9,13 @@ import tyro
 
 def main(num: int) -> None:
     assert torch.cuda.is_available()
+    
+    # Print GPU information
+    num_gpus = torch.cuda.device_count()
+    print(f"Using {num_gpus} GPUs", flush=True)
+    for i in range(num_gpus):
+        device_name = torch.cuda.get_device_name(i)
+        print(f"  GPU {i}: {device_name}", flush=True)
 
     tensors = []
 

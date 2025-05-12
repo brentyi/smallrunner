@@ -19,7 +19,6 @@ from textual.app import App, ComposeResult
 from textual.command import Hit, Hits, Provider
 from textual.containers import Grid, ScrollableContainer
 from textual.widgets import Log, Static, TabbedContent, TabPane
-from textual.work import work
 from textual_fspicker import FileOpen
 
 
@@ -592,9 +591,9 @@ class SmallRunner(App):
         self.set_interval(0.5, self._poll_update)
         self._poll_update()
 
-    @work
-    async def _open_file_picker(self) -> None:
+    def _open_file_picker(self) -> None:
         """Open a file picker dialog to select a shell script."""
+        # Textual 3.x doesn't use the same work/worker system, so we use a simpler approach
         file_picker = FileOpen(
             title="Select a shell script",
             filters=[
@@ -602,9 +601,8 @@ class SmallRunner(App):
             ]
         )
 
-        # Show the file picker and wait for the result
-        if selected_path := await self.push_screen_wait(file_picker):
-            self._add_jobs_from_script(selected_path)
+        # Show the file picker
+        self.push_screen(file_picker, callback=self._add_jobs_from_script)
 
     def _add_jobs_from_script(self, selected_path: Path) -> None:
         """Add jobs from the selected shell script.

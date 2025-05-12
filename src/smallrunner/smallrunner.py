@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Dict, List, Literal, Optional, override
+from typing import IO, Any, Dict, List, Literal, Optional, Tuple, Union, override
 
 import pynvml
 import tyro
@@ -19,7 +19,7 @@ from textual.app import App, ComposeResult
 from textual.command import Hit, Hits, Provider
 from textual.containers import Grid, ScrollableContainer
 from textual.widgets import Log, Static, TabbedContent, TabPane
-from textual_fspicker import FileOpen
+from textual_fspicker import FileOpen, Filters
 
 
 def main(
@@ -86,8 +86,12 @@ def main(
             print("[yellow]Falling back to default GPU allocation[/yellow]")
 
     app = SmallRunner(
-        tuple(gpu_ids), tuple(commands), concurrent_jobs, gpus_per_job, topology,
-        enforce_python=enforce_python
+        tuple(gpu_ids),
+        tuple(commands),
+        concurrent_jobs,
+        gpus_per_job,
+        topology,
+        enforce_python=enforce_python,
     )
     app.run()
 
@@ -207,8 +211,8 @@ class JobAdjustmentCommands(Provider):
         app = self.app
         assert isinstance(app, SmallRunner)
 
-        # Add command to add new jobs
-        add_jobs_command = "Add jobs from shell script"
+        # Add command to queue new jobs
+        add_jobs_command = "Queue new jobs (opens file picker)"
         score = matcher.match(add_jobs_command)
         if score > 0:
             yield Hit(
@@ -393,7 +397,9 @@ class SmallRunner(App):
         self._topology = topology
         self._gpu_groups = []  # Will store groups of GPUs for multi-GPU jobs
         self._job_threads = []  # Keep track of running job threads
-        self._enforce_python = enforce_python  # For validating commands from shell scripts
+        self._enforce_python = (
+            enforce_python  # For validating commands from shell scripts
+        )
 
         # If using multi-GPU jobs, limit number of primary GPUs based on --gpus_per_job
         if gpus_per_job > 1 and len(cuda_device_ids) > 1:
@@ -593,30 +599,33 @@ class SmallRunner(App):
 
     def _open_file_picker(self) -> None:
         """Open a file picker dialog to select a shell script."""
-        # Textual 3.x doesn't use the same work/worker system, so we use a simpler approach
         file_picker = FileOpen(
             title="Select a shell script",
-            filters=[
-                ("Shell Scripts", ["*.sh"])
-            ]
+            filters=Filters(("*.sh", lambda path: path.suffix == ".sh")),
         )
 
         # Show the file picker
         self.push_screen(file_picker, callback=self._add_jobs_from_script)
 
-    def _add_jobs_from_script(self, selected_path: Path) -> None:
+    def _add_jobs_from_script(self, selected_path: Path | None) -> None:
         """Add jobs from the selected shell script.
 
         Args:
-            selected_path: The path to the selected shell script
+            selected_path: The path to the selected shell script, or None if canceled
         """
+        if selected_path is None:
+            return
+
         try:
             # Parse commands from the shell script
             new_commands = parse_commands((selected_path,), self._enforce_python)
 
             if not new_commands:
                 # Show a notification if no valid commands were found
-                self.notify("No valid commands found in the selected shell script", severity="warning")
+                self.notify(
+                    "No valid commands found in the selected shell script",
+                    severity="warning",
+                )
                 return
 
             # Assign IDs to the new commands based on the last used ID
@@ -646,7 +655,10 @@ class SmallRunner(App):
             write_to_log(self._state, message)
 
             # Show a notification
-            self.notify(f"Added {len(new_commands)} jobs from {selected_path.name}", severity="information")
+            self.notify(
+                f"Added {len(new_commands)} jobs from {selected_path.name}",
+                severity="information",
+            )
 
         except Exception as e:
             # Show error notification if something goes wrong

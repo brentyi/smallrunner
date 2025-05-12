@@ -19,6 +19,8 @@ from textual.app import App, ComposeResult
 from textual.command import Hit, Hits, Provider
 from textual.containers import Grid, ScrollableContainer
 from textual.widgets import Log, Static, TabbedContent, TabPane
+from textual.work import work
+from textual_fspicker import FileOpen
 
 
 def main(
@@ -85,7 +87,8 @@ def main(
             print("[yellow]Falling back to default GPU allocation[/yellow]")
 
     app = SmallRunner(
-        tuple(gpu_ids), tuple(commands), concurrent_jobs, gpus_per_job, topology
+        tuple(gpu_ids), tuple(commands), concurrent_jobs, gpus_per_job, topology,
+        enforce_python=enforce_python
     )
     app.run()
 
@@ -196,14 +199,25 @@ class GpuOutputContainer(ScrollableContainer):
 
 
 class JobAdjustmentCommands(Provider):
-    """A command provider to open a Python file in the current working directory."""
+    """A command provider for job management in the current working directory."""
 
     async def search(self, query: str) -> Hits:
-        """Search for Python files."""
+        """Search for job management commands."""
         matcher = self.matcher(query)
 
         app = self.app
         assert isinstance(app, SmallRunner)
+
+        # Add command to add new jobs
+        add_jobs_command = "Add jobs from shell script"
+        score = matcher.match(add_jobs_command)
+        if score > 0:
+            yield Hit(
+                score,
+                matcher.highlight(add_jobs_command),
+                lambda: app._open_file_picker(),
+                help="Select a shell script to add jobs to the queue.",
+            )
 
         for command in app._commands_left:
             skip_command = "Skip " + str(command)
@@ -369,6 +383,7 @@ class SmallRunner(App):
         concurrent_jobs: int = 1,
         gpus_per_job: int = 1,
         topology: Optional[Dict[int, List[int]]] = None,
+        enforce_python: bool = True,
     ) -> None:
         super().__init__()
 
@@ -379,6 +394,7 @@ class SmallRunner(App):
         self._topology = topology
         self._gpu_groups = []  # Will store groups of GPUs for multi-GPU jobs
         self._job_threads = []  # Keep track of running job threads
+        self._enforce_python = enforce_python  # For validating commands from shell scripts
 
         # If using multi-GPU jobs, limit number of primary GPUs based on --gpus_per_job
         if gpus_per_job > 1 and len(cuda_device_ids) > 1:
@@ -575,6 +591,69 @@ class SmallRunner(App):
     def on_mount(self) -> None:
         self.set_interval(0.5, self._poll_update)
         self._poll_update()
+
+    @work
+    async def _open_file_picker(self) -> None:
+        """Open a file picker dialog to select a shell script."""
+        file_picker = FileOpen(
+            title="Select a shell script",
+            filters=[
+                ("Shell Scripts", ["*.sh"])
+            ]
+        )
+
+        # Show the file picker and wait for the result
+        if selected_path := await self.push_screen_wait(file_picker):
+            self._add_jobs_from_script(selected_path)
+
+    def _add_jobs_from_script(self, selected_path: Path) -> None:
+        """Add jobs from the selected shell script.
+
+        Args:
+            selected_path: The path to the selected shell script
+        """
+        try:
+            # Parse commands from the shell script
+            new_commands = parse_commands((selected_path,), self._enforce_python)
+
+            if not new_commands:
+                # Show a notification if no valid commands were found
+                self.notify("No valid commands found in the selected shell script", severity="warning")
+                return
+
+            # Assign IDs to the new commands based on the last used ID
+            # Get all existing command IDs to ensure uniqueness
+            existing_ids = set()
+            for cmd in self._commands:
+                existing_ids.add(cmd.id)
+            for cmd in self._commands_left:
+                existing_ids.add(cmd.id)
+            for gpu_id in self._cuda_device_ids:
+                for job_index in range(self._jobs_per_gpu):
+                    cmd = self._running_commands[gpu_id][job_index]
+                    if cmd is not None:
+                        existing_ids.add(cmd.id)
+
+            next_id = max(existing_ids) + 1 if existing_ids else 1
+            for i, cmd in enumerate(new_commands):
+                cmd.id = next_id + i
+
+            # Add the new commands to the waiting queue (prepend to _commands_left for LIFO order)
+            for cmd in reversed(new_commands):
+                self._commands_left.append(cmd)
+
+            # Log the addition
+            message = f"Added {len(new_commands)} jobs from {selected_path}"
+            self._state.show_on_exit.append(message)
+            write_to_log(self._state, message)
+
+            # Show a notification
+            self.notify(f"Added {len(new_commands)} jobs from {selected_path.name}", severity="information")
+
+        except Exception as e:
+            # Show error notification if something goes wrong
+            self.notify(f"Error adding jobs: {e}", severity="error")
+            print(f"[red]Error adding jobs: {e}[/red]")
 
     def exit(self, *args, **kwargs) -> None:
         """Override exit to mark the app as shutting down."""

@@ -11,6 +11,7 @@ dependencies = [
     "nvidia-ml-py",
     "tyro",
     "textual",
+    "textual-fspicker",
 ]
 authors = [
     { name = "brentyi", email = "brentyi@berkeley.edu" },

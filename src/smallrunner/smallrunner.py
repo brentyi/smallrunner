@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Dict, List, Literal, Optional, Set, override
+from typing import IO, Dict, List, Literal, Optional, override
 
 import pynvml
 import tyro
@@ -132,6 +132,7 @@ class GlobalState:
     ]  # List of dictionaries containing finished job information
     start_time: float  # Start time for all jobs
     show_on_exit: list[str]  # List of strings to show when smallrunner exits
+    log_file_path: Path = Path(".smallrunner_log")  # Path to the log file
 
 
 class GpuOutputContainer(ScrollableContainer):
@@ -315,6 +316,20 @@ class SummaryDisplay(Static):
         self.update(summary)
 
 
+def write_to_log(state: GlobalState, message: str) -> None:
+    """Write a message to the log file.
+
+    Args:
+        state: The global state containing the log file path
+        message: The message to write to the log file
+    """
+    try:
+        with open(state.log_file_path, "a") as f:
+            f.write(f"{message}\n")
+    except Exception as e:
+        print(f"[yellow]Warning: Could not write to log file: {e}[/yellow]")
+
+
 class SmallRunner(App):
     COMMANDS = App.COMMANDS | {JobAdjustmentCommands}
     CSS = """
@@ -376,10 +391,10 @@ class SmallRunner(App):
                 self._gpu_groups = self._create_topology_aware_gpu_groups(
                     cuda_device_ids, gpus_per_job
                 )
-                
+
                 # Sort groups by connection quality (best connections first)
                 self._sort_gpu_groups_by_connection_quality()
-                
+
                 # Use the first GPU from each group as primary GPUs
                 primary_gpus = [group[0] for group in self._gpu_groups[:max_jobs]]
                 print(
@@ -480,17 +495,17 @@ class SmallRunner(App):
                 break
 
         return gpu_groups
-        
+
     def _sort_gpu_groups_by_connection_quality(self) -> None:
         """Sort GPU groups by connection quality, with best connections first.
-        
+
         This evaluates the overall connection quality of each group by calculating
         the average connection level between the primary GPU and other GPUs in the group.
         Lower connection levels are better (0=same device, 5=separate systems).
         """
         if not self._topology or not self._gpu_groups:
             return
-            
+
         # Calculate connection quality score for each group
         group_scores = []
         for group in self._gpu_groups:
@@ -498,42 +513,64 @@ class SmallRunner(App):
                 # Single GPU groups have perfect score
                 group_scores.append((group, 0))
                 continue
-                
+
             primary_gpu = group[0]
             other_gpus = group[1:]
-            
+
             # Calculate average connection level (lower is better)
             connection_levels = []
             for other_gpu in other_gpus:
                 try:
                     handle_i = pynvml.nvmlDeviceGetHandleByIndex(primary_gpu)
                     handle_j = pynvml.nvmlDeviceGetHandleByIndex(other_gpu)
-                    level = pynvml.nvmlDeviceGetTopologyCommonAncestor(handle_i, handle_j)
+                    level = pynvml.nvmlDeviceGetTopologyCommonAncestor(
+                        handle_i, handle_j
+                    )
                     connection_levels.append(level)
                 except Exception:
                     # If we can't get topology info, assume worst connection
                     connection_levels.append(5)
-            
+
             # Calculate average - lower scores are better
-            avg_level = sum(connection_levels) / len(connection_levels) if connection_levels else 5
+            avg_level = (
+                sum(connection_levels) / len(connection_levels)
+                if connection_levels
+                else 5
+            )
             group_scores.append((group, avg_level))
-        
+
         # Sort groups by score (lowest/best first)
         group_scores.sort(key=lambda x: x[1])
-        
+
         # Replace groups with sorted version
         self._gpu_groups = [group for group, _ in group_scores]
-        
+
         # Print info about the sorted groups
         print("GPU groups sorted by connection quality (best first):")
         for i, (group, score) in enumerate(group_scores):
-            connection_type = "excellent" if score < 2 else "good" if score < 3 else "fair" if score < 4 else "poor"
-            print(f"  Group {i+1}: GPUs {group} - {connection_type} connection quality (score: {score:.1f})")
+            connection_type = (
+                "excellent"
+                if score < 2
+                else "good"
+                if score < 3
+                else "fair"
+                if score < 4
+                else "poor"
+            )
+            print(
+                f"  Group {i + 1}: GPUs {group} - {connection_type} connection quality (score: {score:.1f})"
+            )
 
     def _handle_exit(self):
         print("\n[bold]smallrunner[/bold] exiting. Showing on-exit information:")
+
+        # First, write a header to the log file
+        header = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] smallrunner session summary:"
+        write_to_log(self._state, header)
+
         for item in self._state.show_on_exit:
             print("\t", item)
+            # Don't duplicate items that were already logged during execution
 
     def on_mount(self) -> None:
         self.set_interval(0.5, self._poll_update)
@@ -571,6 +608,7 @@ class SmallRunner(App):
                 finished_message = f"{command} [yellow]skipped[/yellow]"
                 self._commands_finished.append(finished_message)
                 self._state.show_on_exit.append(finished_message)
+                write_to_log(self._state, finished_message)
             self._commands_left.clear()
         else:
             (command,) = [cmd for cmd in self._commands_left if cmd.id == command_id]
@@ -580,6 +618,7 @@ class SmallRunner(App):
             finished_message = f"{command} [yellow]skipped[/yellow]"
             self._commands_finished.append(finished_message)
             self._state.show_on_exit.append(finished_message)
+            write_to_log(self._state, finished_message)
 
     def _run_job(self, gpu_id: int, job_index: int, command: Command) -> None:
         logdir = Path(
@@ -715,9 +754,9 @@ class SmallRunner(App):
             # More compact format for multi-GPU jobs
             gpu_info = f"GPU [bold]{','.join(str(g) for g in gpu_ids_for_job)}[/bold]-{job_index}"
 
-        self._state.show_on_exit.append(
-            f"Started [cyan]{shlex.join(args)}[/cyan] on {gpu_info}, logging to [blue]{logdir}[/blue]"
-        )
+        message = f"Started [cyan]{shlex.join(args)}[/cyan] on {gpu_info}, logging to [blue]{logdir}[/blue]"
+        self._state.show_on_exit.append(message)
+        write_to_log(self._state, message)
 
         self._state.logdir_from_gpu_id[gpu_id][job_index] = logdir
         self._state.command_from_gpu_id[gpu_id][job_index] = shlex.join(args)
@@ -755,6 +794,7 @@ class SmallRunner(App):
                 killed_message = f"{command} [red]killed[/red] after [bold]{elapsed_str}[/bold], logs saved to [blue]{logdir}[/blue]"
                 self._commands_finished.append(killed_message)
                 self._state.show_on_exit.append(killed_message)
+                write_to_log(self._state, killed_message)
 
         # Free all GPUs used by this job
         self._gpu_free_state[gpu_id][job_index] = True
@@ -815,6 +855,7 @@ class SmallRunner(App):
         finished_message = f"{finished_command} {status_part} {time_part}, {log_part}"
         self._commands_finished.append(finished_message)
         self._state.show_on_exit.append(finished_message)
+        write_to_log(self._state, finished_message)
 
     def _handle_process_output(
         self,
@@ -922,19 +963,21 @@ class SmallRunner(App):
                 if command is not None:
                     # Get all GPUs used by this job
                     gpus_used = self._state.gpus_used_from_gpu_id[gpu_id][job_index]
-                    
+
                     # Create GPU identifier based on whether multiple GPUs are used
                     if not gpus_used or len(gpus_used) <= 1:
                         # Single GPU job
                         gpu_label = f"GPU {gpu_id}-{job_index}"
                     else:
                         # Multi-GPU job - show all GPUs in the group
-                        gpu_label = f"GPU {','.join(str(g) for g in gpus_used)}-{job_index}"
-                    
+                        gpu_label = (
+                            f"GPU {','.join(str(g) for g in gpus_used)}-{job_index}"
+                        )
+
                     running_jobs.append(
                         f"{gpu_label}: {command}, logs to [blue]{self._state.logdir_from_gpu_id[gpu_id][job_index]}[/blue]"
                     )
-                    
+
         self._update_list("#list-running", running_jobs)
         self._update_list("#list-finished", self._commands_finished)
 

@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any, Dict, List, Literal, Optional, Tuple, Union, override
+from typing import IO, Dict, List, Literal, Optional, override
 
 import pynvml
 import tyro
@@ -18,8 +18,11 @@ from rich import print
 from textual.app import App, ComposeResult
 from textual.command import Hit, Hits, Provider
 from textual.containers import Grid, ScrollableContainer
-from textual.widgets import Log, Static, TabbedContent, TabPane
+from textual.widgets import Button, Log, Static, TabbedContent, TabPane
 from textual_fspicker import FileOpen, Filters
+
+# Global variable to track GPU active/inactive states
+GPU_ACTIVE_STATES = {}
 
 
 def main(
@@ -59,6 +62,14 @@ def main(
     # Register the signal handler
     signal.signal(signal.SIGINT, handle_sigint)
     pynvml.nvmlInit()
+
+    # Initialize global GPU states for all GPUs in the system
+    global GPU_ACTIVE_STATES
+    all_gpu_count = pynvml.nvmlDeviceGetCount()
+    if not GPU_ACTIVE_STATES:
+        GPU_ACTIVE_STATES = {
+            i: True for i in range(all_gpu_count)
+        }  # Default all GPUs to active
     if gpu_ids == "all_free":
         gpu_ids = get_available_gpus(mem_ratio_threshold)
     else:
@@ -374,6 +385,15 @@ class SmallRunner(App):
     .gpu-groups {
         height: 9;
     }
+
+    #gpu-manager-grid {
+        grid-size: 2;
+        grid-gutter: 1;
+    }
+
+    .gpu-toggle-button {
+        margin: 1;
+    }
     """
 
     # Flag to indicate if the app is shutting down
@@ -400,6 +420,16 @@ class SmallRunner(App):
         self._enforce_python = (
             enforce_python  # For validating commands from shell scripts
         )
+
+        # Track all GPUs and their active/inactive states
+        all_gpu_count = pynvml.nvmlDeviceGetCount()
+        # Initialize global GPU states if not already done
+        global GPU_ACTIVE_STATES
+        if not GPU_ACTIVE_STATES:
+            GPU_ACTIVE_STATES = {
+                i: True for i in range(all_gpu_count)
+            }  # Default all GPUs to active
+        self._all_gpu_states = GPU_ACTIVE_STATES  # Reference to global states
 
         # If using multi-GPU jobs, limit number of primary GPUs based on --gpus_per_job
         if gpus_per_job > 1 and len(cuda_device_ids) > 1:
@@ -744,6 +774,10 @@ class SmallRunner(App):
                             ):
                                 continue
 
+                            # Skip if GPU is not active
+                            if not self._all_gpu_states.get(other_gpu_id, True):
+                                continue
+
                             available_additional_gpus.append(other_gpu_id)
 
                         if available_additional_gpus:
@@ -785,6 +819,10 @@ class SmallRunner(App):
                     if (
                         get_gpu_memory_usage(other_gpu_id) > 0.1
                     ):  # Same threshold used for initial selection
+                        continue
+
+                    # Skip if GPU is not active
+                    if not self._all_gpu_states.get(other_gpu_id, True):
                         continue
 
                     available_gpus.append(other_gpu_id)
@@ -1157,11 +1195,35 @@ class SmallRunner(App):
         list_widget = self.query_one(selector, Static)
         list_widget.update("\n".join(map(str, items)))
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button press events."""
+        button_id = event.button.id
+        if button_id and button_id.startswith("gpu-toggle-"):
+            gpu_id = int(button_id.split("-")[-1])
+
+            # Toggle the GPU state
+            self._all_gpu_states[gpu_id] = not self._all_gpu_states[gpu_id]
+
+            # Update the status display
+            status_widget = self.query_one(f"#gpu-status-{gpu_id}", Static)
+            status = (
+                "[green]Active[/green]"
+                if self._all_gpu_states[gpu_id]
+                else "[red]Inactive[/red]"
+            )
+            status_widget.update(f"Status: {status}")
+
+            # Update the button text
+            event.button.label = (
+                "Deactivate" if self._all_gpu_states[gpu_id] else "Activate"
+            )
+
     @override
     def compose(self) -> ComposeResult:
         with TabbedContent():
             yield from self._create_log_tab("Outputs")
             yield from self._create_queue_tab()
+            yield from self._create_gpu_manager_tab()
 
     def _create_log_tab(self, title: str) -> ComposeResult:
         with TabPane(title):
@@ -1203,6 +1265,43 @@ class SmallRunner(App):
                             "[bold reverse] GPU Groups [/bold reverse]"
                         )
                         yield Static(id="list-gpu-groups")
+
+    def _create_gpu_manager_tab(self) -> ComposeResult:
+        """Create the GPU Manager tab for controlling active/inactive GPU states."""
+        with TabPane("GPU Manager"):
+            yield SummaryDisplay(self._state, self)
+
+            # Create a scrollable container for GPU controls
+            with Grid(id="gpu-manager-grid"):
+                for gpu_id in range(pynvml.nvmlDeviceGetCount()):
+                    with ScrollableContainer(
+                        classes="bordered-white", id=f"gpu-container-{gpu_id}"
+                    ) as gpu_container:
+                        # GPU info
+                        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+                        gpu_name = pynvml.nvmlDeviceGetName(handle)
+                        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                        mem_total = float(mem_info.total) / (1024**3)
+
+                        gpu_container.border_title = f"[bold reverse] GPU {gpu_id}: {gpu_name} ({mem_total:.1f}GB) [/bold reverse]"
+
+                        # Status indicator
+                        status = (
+                            "[green]Active[/green]"
+                            if self._all_gpu_states[gpu_id]
+                            else "[red]Inactive[/red]"
+                        )
+                        yield Static(f"Status: {status}", id=f"gpu-status-{gpu_id}")
+
+                        # Toggle button
+                        button_text = (
+                            "Deactivate" if self._all_gpu_states[gpu_id] else "Activate"
+                        )
+                        yield Button(
+                            button_text,
+                            id=f"gpu-toggle-{gpu_id}",
+                            classes="gpu-toggle-button",
+                        )
 
 
 def get_gpu_topology() -> Dict[int, List[int]]:
@@ -1267,7 +1366,7 @@ def get_gpu_topology() -> Dict[int, List[int]]:
 def get_available_gpus(mem_ratio_threshold: float) -> tuple[int, ...]:
     """Determine the tuple of available GPU IDs based on memory usage and visibility.
 
-    This function filters GPUs based on their memory usage and the CUDA_VISIBLE_DEVICES
+    This function filters GPUs based on their memory usage, active state, and the CUDA_VISIBLE_DEVICES
     environment variable.
 
     Args:
@@ -1279,10 +1378,14 @@ def get_available_gpus(mem_ratio_threshold: float) -> tuple[int, ...]:
     gpu_count = pynvml.nvmlDeviceGetCount()
     print(f"Total GPUs detected: {gpu_count}")
 
+    # Check both memory usage and active state
     gpu_ids = [
-        i for i in range(gpu_count) if get_gpu_memory_usage(i) <= mem_ratio_threshold
+        i
+        for i in range(gpu_count)
+        if get_gpu_memory_usage(i) <= mem_ratio_threshold
+        and GPU_ACTIVE_STATES.get(i, True)
     ]
-    print(f"After filtering by memory threshold: {gpu_ids}")
+    print(f"After filtering by memory threshold and active state: {gpu_ids}")
 
     return tuple(sorted(gpu_ids))
 

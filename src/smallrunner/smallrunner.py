@@ -18,11 +18,66 @@ from rich import print
 from textual.app import App, ComposeResult
 from textual.command import Hit, Hits, Provider
 from textual.containers import Grid, ScrollableContainer
-from textual.widgets import Button, Log, Static, TabbedContent, TabPane
+from textual.screen import ModalScreen
+from textual.widgets import Button, Label, Log, Static, TabbedContent, TabPane
 from textual_fspicker import FileOpen, Filters
 
 # Global variable to track GPU active/inactive states
 GPU_ACTIVE_STATES = {}
+
+
+class KillConfirmationDialog(ModalScreen):
+    """Modal screen for confirming job kill actions."""
+
+    def __init__(self, command_id: int, gpu_id: int, job_index: int) -> None:
+        super().__init__()
+        self.command_id = command_id
+        self.gpu_id = gpu_id
+        self.job_index = job_index
+
+    def compose(self) -> ComposeResult:
+        with Grid(id="dialog-grid"):
+            yield Label(
+                f"Are you sure you want to kill Job {self.command_id} on GPU {self.gpu_id}?",
+                id="confirmation-message",
+            )
+            yield Button("Cancel", variant="primary", id="cancel-button")
+            yield Button("Kill Job", variant="error", id="kill-button")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "kill-button":
+            # Confirm the kill action
+            self.dismiss(True)
+        else:
+            # Cancel the action
+            self.dismiss(False)
+
+
+class RestartConfirmationDialog(ModalScreen):
+    """Modal screen for confirming job restart actions."""
+
+    def __init__(self, command_id: int, gpu_id: int, job_index: int) -> None:
+        super().__init__()
+        self.command_id = command_id
+        self.gpu_id = gpu_id
+        self.job_index = job_index
+
+    def compose(self) -> ComposeResult:
+        with Grid(id="dialog-grid"):
+            yield Label(
+                f"Are you sure you want to kill and restart Job {self.command_id} on GPU {self.gpu_id}?",
+                id="confirmation-message",
+            )
+            yield Button("Cancel", variant="primary", id="cancel-button")
+            yield Button("Kill & Restart", variant="error", id="restart-button")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "restart-button":
+            # Confirm the restart action
+            self.dismiss(True)
+        else:
+            # Cancel the action
+            self.dismiss(False)
 
 
 def main(
@@ -386,13 +441,106 @@ class SmallRunner(App):
         height: 9;
     }
 
-    #gpu-manager-grid {
-        grid-size: 2;
+    .gpu-buttons-grid {
+        grid-size: 3;
         grid-gutter: 1;
+        margin-top: 0;
+        height: auto;
     }
 
     .gpu-toggle-button {
-        margin: 1;
+        margin: 0 1;
+        height: 3;
+        background: $primary;
+    }
+
+    .gpu-toggle-button:hover {
+        background: $primary-lighten-1;
+    }
+
+    .gpu-kill-button {
+        margin: 0 1;
+        height: 3;
+        background: #8B0000;  /* Dark red */
+        color: #FFFFFF;
+    }
+
+    .gpu-kill-button:hover {
+        background: #B22222;  /* Firebrick red on hover */
+    }
+
+    .gpu-restart-button {
+        margin: 0 1;
+        height: 3;
+        background: #2E4E8B;  /* Dark blue */
+        color: #FFFFFF;
+    }
+
+    .gpu-restart-button:hover {
+        background: #4169E1;  /* Royal blue on hover */
+    }
+
+    /* Confirmation dialog styles */
+    KillConfirmationDialog, RestartConfirmationDialog {
+        align: center middle;
+    }
+
+    #dialog-grid {
+        grid-size: 2;
+        grid-gutter: 1 2;
+        grid-rows: 1fr 3;
+        padding: 0 1;
+        width: 60;
+        height: 11;
+        border: thick $background 80%;
+        background: $surface;
+    }
+
+    #confirmation-message {
+        column-span: 2;
+        content-align: center middle;
+        height: 100%;
+    }
+
+    #dialog-grid Button {
+        width: 100%;
+    }
+
+    /* Mini GPU controls for output containers */
+    .gpu-mini-controls {
+        grid-size: 3;
+        grid-gutter: 1;
+        height: 3;
+        margin-bottom: 0;
+    }
+
+    .gpu-kill-button-mini {
+        height: 3;
+        background: #8B0000;
+        color: #FFFFFF;
+    }
+
+    .gpu-kill-button-mini:hover {
+        background: #B22222;
+    }
+
+    .gpu-restart-button-mini {
+        height: 3;
+        background: #2E4E8B;
+        color: #FFFFFF;
+    }
+
+    .gpu-restart-button-mini:hover {
+        background: #4169E1;
+    }
+
+    .gpu-toggle-button-mini {
+        height: 3;
+        background: $primary;
+    }
+
+    .gpu-toggle-button-mini:hover {
+        background: $primary-lighten-1;
     }
     """
 
@@ -466,7 +614,6 @@ class SmallRunner(App):
             print(f"Limited to {len(cuda_device_ids)} GPUs based on command count")
 
         self._cuda_device_ids = cuda_device_ids
-        self._commands = commands
         self._jobs_per_gpu = (
             concurrent_jobs  # Maintain compatibility with existing code
         )
@@ -661,8 +808,6 @@ class SmallRunner(App):
             # Assign IDs to the new commands based on the last used ID
             # Get all existing command IDs to ensure uniqueness
             existing_ids = set()
-            for cmd in self._commands:
-                existing_ids.add(cmd.id)
             for cmd in self._commands_left:
                 existing_ids.add(cmd.id)
             for gpu_id in self._cuda_device_ids:
@@ -774,7 +919,7 @@ class SmallRunner(App):
                             ):
                                 continue
 
-                            # Skip if GPU is not active
+                            # Skip if GPU is not active (deactivated GPUs are not allocated to new jobs)
                             if not self._all_gpu_states.get(other_gpu_id, True):
                                 continue
 
@@ -821,7 +966,7 @@ class SmallRunner(App):
                     ):  # Same threshold used for initial selection
                         continue
 
-                    # Skip if GPU is not active
+                    # Skip if GPU is not active (deactivated GPUs are not allocated to new jobs)
                     if not self._all_gpu_states.get(other_gpu_id, True):
                         continue
 
@@ -1068,6 +1213,10 @@ class SmallRunner(App):
                 if not self._gpu_free_state[gpu_id][job_index]:
                     continue
 
+                # Don't allocate new jobs to deactivated GPUs
+                if not self._all_gpu_states.get(gpu_id, True):
+                    continue
+
                 if self._commands_left:
                     command = self._commands_left.pop()
                     self._running_commands[gpu_id][job_index] = command
@@ -1191,9 +1340,84 @@ class SmallRunner(App):
                 # If the widget doesn't exist, ignore the error
                 pass
 
+        
+        # Update mini control buttons in output containers
+        for gpu_id in self._cuda_device_ids:
+            for job_index in range(self._jobs_per_gpu):
+                try:
+                    # Update mini control buttons
+                    kill_button = self.query_one(
+                        f"#gpu-kill-{gpu_id}-{job_index}", Button
+                    )
+                    restart_button = self.query_one(
+                        f"#gpu-restart-{gpu_id}-{job_index}", Button
+                    )
+                    
+                    # Show/hide buttons and update labels based on whether job is running  
+                    has_job = (
+                        gpu_id in self._running_commands
+                        and self._running_commands[gpu_id][job_index] is not None
+                    )
+                    
+                    if has_job:
+                        command = self._running_commands[gpu_id][job_index]
+                        # Update mini button labels
+                        kill_button.label = f"Kill {command.id}"
+                        restart_button.label = f"Restart {command.id}"
+                    
+                    kill_button.display = has_job
+                    restart_button.display = has_job
+                except Exception:
+                    # Buttons might not exist yet
+                    pass
+
     def _update_list(self, selector: str, items: list) -> None:
         list_widget = self.query_one(selector, Static)
         list_widget.update("\n".join(map(str, items)))
+
+    def _handle_kill_confirmation(self, confirmed: bool) -> None:
+        """Handle the result of the kill confirmation dialog."""
+        if confirmed and hasattr(self, "_pending_kill_info"):
+            command_id, gpu_id, job_index = self._pending_kill_info
+            self._kill_command(command_id)
+            self.notify(
+                f"Killed job {command_id} on GPU {gpu_id}", severity="information"
+            )
+            # Clean up the pending info
+            delattr(self, "_pending_kill_info")
+
+    def _handle_restart_confirmation(self, confirmed: bool) -> None:
+        """Handle the result of the restart confirmation dialog."""
+        if confirmed and hasattr(self, "_pending_restart_info"):
+            command_id, gpu_id, job_index, command_args = self._pending_restart_info
+
+            # Create new command with same args
+            restart_command = Command(
+                id=max(
+                    [cmd.id for cmd in self._commands_left]
+                    + [
+                        cmd.id
+                        for gpu_cmds in self._running_commands.values()
+                        for cmd in gpu_cmds
+                        if cmd is not None
+                    ]
+                )
+                + 1,
+                args=command_args,
+            )
+
+            # Kill the current job
+            self._kill_command(command_id)
+
+            # Add the command back to the queue
+            self._commands_left.append(restart_command)
+
+            self.notify(
+                f"Killed and requeued job {command_id} on GPU {gpu_id}",
+                severity="information",
+            )
+            # Clean up the pending info
+            delattr(self, "_pending_restart_info")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button press events."""
@@ -1202,28 +1426,57 @@ class SmallRunner(App):
             gpu_id = int(button_id.split("-")[-1])
 
             # Toggle the GPU state
+            # NOTE: Deactivating a GPU only prevents it from being allocated to new jobs.
+            # Any job currently running on this GPU will continue to completion.
             self._all_gpu_states[gpu_id] = not self._all_gpu_states[gpu_id]
-
-            # Update the status display
-            status_widget = self.query_one(f"#gpu-status-{gpu_id}", Static)
-            status = (
-                "[green]Active[/green]"
-                if self._all_gpu_states[gpu_id]
-                else "[red]Inactive[/red]"
-            )
-            status_widget.update(f"Status: {status}")
 
             # Update the button text
             event.button.label = (
                 "Deactivate" if self._all_gpu_states[gpu_id] else "Activate"
             )
+            
+            # Show notification about the state change
+            state_msg = "activated" if self._all_gpu_states[gpu_id] else "deactivated"
+            self.notify(f"GPU {gpu_id} {state_msg}", severity="information")
+
+        elif button_id and button_id.startswith("gpu-kill-"):
+            # Handle kill button: gpu-kill-{gpu_id}-{job_index}
+            parts = button_id.split("-")
+            gpu_id = int(parts[2])
+            job_index = int(parts[3])
+
+            command = self._running_commands[gpu_id][job_index]
+            if command is not None:
+                # Show confirmation dialog
+                dialog = KillConfirmationDialog(command.id, gpu_id, job_index)
+                # Store the dialog info for the callback
+                self._pending_kill_info = (command.id, gpu_id, job_index)
+                self.push_screen(dialog, self._handle_kill_confirmation)
+
+        elif button_id and button_id.startswith("gpu-restart-"):
+            # Handle restart button: gpu-restart-{gpu_id}-{job_index}
+            parts = button_id.split("-")
+            gpu_id = int(parts[2])
+            job_index = int(parts[3])
+
+            command = self._running_commands[gpu_id][job_index]
+            if command is not None:
+                # Show confirmation dialog
+                dialog = RestartConfirmationDialog(command.id, gpu_id, job_index)
+                # Store the command info for the callback
+                self._pending_restart_info = (
+                    command.id,
+                    gpu_id,
+                    job_index,
+                    command.args,
+                )
+                self.push_screen(dialog, self._handle_restart_confirmation)
 
     @override
     def compose(self) -> ComposeResult:
         with TabbedContent():
             yield from self._create_log_tab("Outputs")
             yield from self._create_queue_tab()
-            yield from self._create_gpu_manager_tab()
 
     def _create_log_tab(self, title: str) -> ComposeResult:
         with TabPane(title):
@@ -1232,6 +1485,37 @@ class SmallRunner(App):
                 for i in self._cuda_device_ids:
                     for j in range(self._jobs_per_gpu):
                         with GpuOutputContainer(i, j, self._state):
+                            with Grid(classes="gpu-mini-controls"):
+                                # Control buttons
+                                kill_btn = Button(
+                                    "Kill",
+                                    id=f"gpu-kill-{i}-{j}",
+                                    classes="gpu-kill-button-mini",
+                                )
+                                kill_btn.display = False  # Initially hidden
+                                yield kill_btn
+
+                                restart_btn = Button(
+                                    "Restart",
+                                    id=f"gpu-restart-{i}-{j}",
+                                    classes="gpu-restart-button-mini",
+                                )
+                                restart_btn.display = False  # Initially hidden
+                                yield restart_btn
+
+                                # Toggle button (only show for first job index)
+                                if j == 0:
+                                    toggle_text = (
+                                        "Deactivate"
+                                        if self._all_gpu_states.get(i, True)
+                                        else "Activate"
+                                    )
+                                    yield Button(
+                                        toggle_text,
+                                        id=f"gpu-toggle-{i}",
+                                        classes="gpu-toggle-button-mini",
+                                    )
+
                             yield Log(
                                 id=f"log-display-{i}-{j}",
                                 max_lines=100,
@@ -1267,9 +1551,20 @@ class SmallRunner(App):
                         yield Static(id="list-gpu-groups")
 
     def _create_gpu_manager_tab(self) -> ComposeResult:
-        """Create the GPU Manager tab for controlling active/inactive GPU states."""
+        """Create the GPU Manager tab for controlling active/inactive GPU states.
+
+        Note: Deactivating a GPU prevents new jobs from being allocated to it,
+        but does not affect jobs that are already running on that GPU.
+        """
         with TabPane("GPU Manager"):
             yield SummaryDisplay(self._state, self)
+
+            # Add explanatory text about GPU deactivation
+            yield Static(
+                "[dim]Deactivating a GPU prevents new jobs from being allocated to it, "
+                "but does not affect jobs that are already running on that GPU.[/dim]\n",
+                id="gpu-manager-info",
+            )
 
             # Create a scrollable container for GPU controls
             with Grid(id="gpu-manager-grid"):
@@ -1293,15 +1588,40 @@ class SmallRunner(App):
                         )
                         yield Static(f"Status: {status}", id=f"gpu-status-{gpu_id}")
 
-                        # Toggle button
-                        button_text = (
-                            "Deactivate" if self._all_gpu_states[gpu_id] else "Activate"
-                        )
-                        yield Button(
-                            button_text,
-                            id=f"gpu-toggle-{gpu_id}",
-                            classes="gpu-toggle-button",
-                        )
+                        # Initially empty job info - will be updated by _poll_update
+                        yield Static("", id=f"gpu-jobs-{gpu_id}")
+
+                        # Buttons container
+                        with Grid(classes="gpu-buttons-grid"):
+                            # Toggle button
+                            button_text = (
+                                "Deactivate"
+                                if self._all_gpu_states[gpu_id]
+                                else "Activate"
+                            )
+                            yield Button(
+                                button_text,
+                                id=f"gpu-toggle-{gpu_id}",
+                                classes="gpu-toggle-button",
+                            )
+
+                            # Kill and restart buttons for all job slots (initially hidden)
+                            for job_index in range(self._jobs_per_gpu):
+                                kill_btn = Button(
+                                    f"Kill Job {job_index}",
+                                    id=f"gpu-kill-{gpu_id}-{job_index}",
+                                    classes="gpu-kill-button",
+                                )
+                                kill_btn.display = False  # Initially hidden
+                                yield kill_btn
+
+                                restart_btn = Button(
+                                    f"Kill & Restart Job {job_index}",
+                                    id=f"gpu-restart-{gpu_id}-{job_index}",
+                                    classes="gpu-restart-button",
+                                )
+                                restart_btn.display = False  # Initially hidden
+                                yield restart_btn
 
 
 def get_gpu_topology() -> Dict[int, List[int]]:

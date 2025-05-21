@@ -450,8 +450,9 @@ class SmallRunner(App):
 
     .gpu-toggle-button {
         margin: 0 1;
-        height: 3;
+        height: 1;
         background: $primary;
+        border: none;
     }
 
     .gpu-toggle-button:hover {
@@ -460,9 +461,10 @@ class SmallRunner(App):
 
     .gpu-kill-button {
         margin: 0 1;
-        height: 3;
+        height: 1;
         background: #8B0000;  /* Dark red */
         color: #FFFFFF;
+        border: none;
     }
 
     .gpu-kill-button:hover {
@@ -471,9 +473,10 @@ class SmallRunner(App):
 
     .gpu-restart-button {
         margin: 0 1;
-        height: 3;
+        height: 1;
         background: #2E4E8B;  /* Dark blue */
         color: #FFFFFF;
+        border: none;
     }
 
     .gpu-restart-button:hover {
@@ -510,14 +513,15 @@ class SmallRunner(App):
     .gpu-mini-controls {
         grid-size: 3;
         grid-gutter: 1;
-        height: 3;
+        height: 1;
         margin-bottom: 0;
     }
 
     .gpu-kill-button-mini {
-        height: 3;
+        height: 1;
         background: #8B0000;
         color: #FFFFFF;
+        border: none;
     }
 
     .gpu-kill-button-mini:hover {
@@ -525,9 +529,10 @@ class SmallRunner(App):
     }
 
     .gpu-restart-button-mini {
-        height: 3;
+        height: 1;
         background: #2E4E8B;
         color: #FFFFFF;
+        border: none;
     }
 
     .gpu-restart-button-mini:hover {
@@ -535,8 +540,9 @@ class SmallRunner(App):
     }
 
     .gpu-toggle-button-mini {
-        height: 3;
+        height: 1;
         background: $primary;
+        border: none;
     }
 
     .gpu-toggle-button-mini:hover {

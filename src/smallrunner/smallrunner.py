@@ -81,8 +81,8 @@ class RestartConfirmationDialog(ModalScreen):
 
 
 def main(
-    shell_scripts: tuple[Path, ...],
-    /,
+    shell_scripts: tuple[Path, ...] = (),
+    raw_commands: str | None = None,
     gpu_ids: Literal["all_free"] | tuple[int, ...] = "all_free",
     job_index_cond: str = "i>=0",
     mem_ratio_threshold: float = 0.1,
@@ -135,7 +135,9 @@ def main(
         )
     commands = [
         cmd
-        for i, cmd in enumerate(parse_commands(shell_scripts, enforce_python))
+        for i, cmd in enumerate(
+            parse_commands(shell_scripts, enforce_python, raw_commands)
+        )
         if eval(job_index_cond, {"i": i}, {})
     ]
 
@@ -801,7 +803,7 @@ class SmallRunner(App):
 
         try:
             # Parse commands from the shell script
-            new_commands = parse_commands((selected_path,), self._enforce_python)
+            new_commands = parse_commands((selected_path,), self._enforce_python, None)
 
             if not new_commands:
                 # Show a notification if no valid commands were found
@@ -1346,7 +1348,6 @@ class SmallRunner(App):
                 # If the widget doesn't exist, ignore the error
                 pass
 
-        
         # Update mini control buttons in output containers
         for gpu_id in self._cuda_device_ids:
             for job_index in range(self._jobs_per_gpu):
@@ -1358,19 +1359,19 @@ class SmallRunner(App):
                     restart_button = self.query_one(
                         f"#gpu-restart-{gpu_id}-{job_index}", Button
                     )
-                    
-                    # Show/hide buttons and update labels based on whether job is running  
+
+                    # Show/hide buttons and update labels based on whether job is running
                     has_job = (
                         gpu_id in self._running_commands
                         and self._running_commands[gpu_id][job_index] is not None
                     )
-                    
+
                     if has_job:
                         command = self._running_commands[gpu_id][job_index]
                         # Update mini button labels
                         kill_button.label = f"Kill {command.id}"
                         restart_button.label = f"Restart {command.id}"
-                    
+
                     kill_button.display = has_job
                     restart_button.display = has_job
                 except Exception:
@@ -1440,7 +1441,7 @@ class SmallRunner(App):
             event.button.label = (
                 "Deactivate" if self._all_gpu_states[gpu_id] else "Activate"
             )
-            
+
             # Show notification about the state change
             state_msg = "activated" if self._all_gpu_states[gpu_id] else "deactivated"
             self.notify(f"GPU {gpu_id} {state_msg}", severity="information")
@@ -1731,7 +1732,9 @@ def get_gpu_memory_usage(gpu_index: int) -> float:
 
 
 def parse_commands(
-    shell_scripts: tuple[Path, ...], enforce_python: bool
+    shell_scripts: tuple[Path, ...],
+    enforce_python: bool,
+    raw_commands: str | None = None,
 ) -> list[Command]:
     """Parse shell scripts into a list of Command objects.
 
@@ -1741,6 +1744,7 @@ def parse_commands(
     Args:
         shell_scripts: Paths to shell scripts containing commands.
         enforce_python: If True, ensures all commands start with 'python'.
+        raw_commands: Optional raw command string to append to the parsed commands.
 
     Returns:
         A list of Command objects representing the parsed commands.
@@ -1749,6 +1753,8 @@ def parse_commands(
         AssertionError: If enforce_python is True and a command doesn't start with 'python'.
     """
     script_contents = "\n".join(script.read_text() for script in shell_scripts)
+    if raw_commands:
+        script_contents = script_contents + "\n" + raw_commands
     lines = re.split(r"(?<!\\)\n", script_contents)
 
     commands = []

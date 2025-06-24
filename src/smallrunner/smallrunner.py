@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Dict, List, Literal, Optional, override
+from typing import IO, Dict, List, Literal, Optional
 
 import pynvml
 import tyro
@@ -21,6 +21,7 @@ from textual.containers import Grid, ScrollableContainer
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label, Log, Static, TabbedContent, TabPane
 from textual_fspicker import FileOpen, Filters
+from typing_extensions import override
 
 # Global variable to track GPU active/inactive states
 GPU_ACTIVE_STATES = {}
